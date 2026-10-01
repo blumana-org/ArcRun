@@ -47,7 +47,10 @@ const config: Config = {
           path: '../docs',
           routeBasePath: '/docs',
           sidebarPath: './sidebars.ts',
-          editUrl: 'https://github.com/blumana-org/ArcRun/tree/master/',
+          // docs/ lives outside website/, so build the edit link from the
+          // doc path instead of letting Docusaurus prefix it with "../".
+          editUrl: ({docPath}) =>
+            `https://github.com/blumana-org/ArcRun/edit/master/docs/${docPath}`,
           // Internal working documents (plans, audits, handoff notes) are not
           // part of the published documentation.
           exclude: [
