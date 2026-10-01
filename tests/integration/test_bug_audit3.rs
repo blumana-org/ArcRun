@@ -2590,6 +2590,118 @@ async fn test_audit2_a5_resolver_blocks_rebinding_to_internal() {
     );
 }
 
+// -----------------------------------------------------------------------------
+// A5 follow-up — SSRF allowlist (ALLOWED_HOSTNAMES / ALLOWED_CIDRS)
+// -----------------------------------------------------------------------------
+//
+// # Original bug (prod incident 2026-09-30)
+// Upgrading from v1.2.0 to an image carrying A5 made every on_start webhook that
+// targets an internal service by name (`http://backend:8000/hook`, a docker/k8s
+// service resolving to a private IP) fail at delivery: creation-time validation
+// accepted the name (not on any blocklist), then `SsrfGuardResolver` refused the
+// resolved private IP and the task went to Failure. Public https URLs kept working,
+// which made it look like an http-vs-https problem. There was no way to trust an
+// internal target short of `SKIP_SSRF_VALIDATION=1`, which drops every check.
+//
+// # Fix
+// `SecurityConfig::allowed_hostnames` (exact or `.suffix`) and `allowed_cidrs`
+// are honoured by BOTH gates: `validate_webhook_url_with_config` (creation) and
+// the resolver (delivery). An allowlisted hostname is resolved without an IP
+// check; a resolved IP inside an allowed CIDR is accepted although private.
+// Everything not allowlisted keeps the A5 behaviour.
+//
+// # What the test asserts
+// Same real mock server / `localhost` setup as the rebinding test above:
+// * strict + `ALLOWED_HOSTNAMES=localhost` ⇒ creation-time validation accepts the
+//   URL (it is on the default blocklist otherwise) and the delivery reaches the
+//   server (hits == 1);
+// * strict + `ALLOWED_CIDRS=127.0.0.0/8` ⇒ the resolver accepts the loopback IP
+//   `localhost` resolves to and the delivery reaches the server (hits == 2);
+// * strict with an allowlist that does NOT cover the target (another hostname,
+//   another network) ⇒ still refused at resolution (hits stays 2).
+// Goes red if either gate ignores the allowlist.
+
+#[tokio::test]
+async fn test_audit2_a5_allowlist_permits_trusted_internal_target() {
+    use arcrun::action::{ActionContext, ActionExecutor};
+    use arcrun::config::{SecurityConfig, parse_cidr_list};
+    use arcrun::dtos::NewActionDto;
+    use arcrun::models::ActionKindEnum;
+    use arcrun::validation::validate_webhook_url_with_config;
+
+    let ctx = || ActionContext {
+        host_address: "http://localhost:8080".to_string(),
+        webhook_idempotency_timeout: std::time::Duration::from_secs(30),
+    };
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (url, _shutdown) = spawn_webhook_server(hits.clone());
+    let url_by_name = url.replace("127.0.0.1", "localhost");
+    let action = NewActionDto {
+        kind: ActionKindEnum::Webhook,
+        params: serde_json::json!({ "url": url_by_name, "verb": "Post" }),
+    };
+    let strict = || SecurityConfig {
+        skip_ssrf_validation: false,
+        ..SecurityConfig::default()
+    };
+
+    // 1. Hostname allowlist: both gates open for the trusted name.
+    let by_host = SecurityConfig {
+        allowed_hostnames: vec!["LOCALHOST".to_string()],
+        ..strict()
+    };
+    assert!(
+        validate_webhook_url_with_config(&url_by_name, &by_host).is_ok(),
+        "allowlisted hostname must pass creation-time validation despite the blocklist"
+    );
+    let res = ActionExecutor::with_security_config(ctx(), &by_host)
+        .execute_batch_action(&action, None, serde_json::json!({}))
+        .await;
+    assert!(
+        res.is_ok(),
+        "allowlisted hostname must be delivered: {res:?}"
+    );
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // 2. CIDR allowlist: the resolver accepts the private IP the name resolves to.
+    let by_cidr = SecurityConfig {
+        allowed_cidrs: parse_cidr_list("ALLOWED_CIDRS", "127.0.0.0/8,::1").unwrap(),
+        ..strict()
+    };
+    let res = ActionExecutor::with_security_config(ctx(), &by_cidr)
+        .execute_batch_action(&action, None, serde_json::json!({}))
+        .await;
+    assert!(
+        res.is_ok(),
+        "IP inside an allowed CIDR must be delivered: {res:?}"
+    );
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    // 3. An allowlist that does not cover the target changes nothing.
+    let unrelated = SecurityConfig {
+        allowed_hostnames: vec!["backend".to_string(), ".svc.cluster.local".to_string()],
+        allowed_cidrs: parse_cidr_list("ALLOWED_CIDRS", "10.42.0.0/16").unwrap(),
+        ..strict()
+    };
+    let res = ActionExecutor::with_security_config(ctx(), &unrelated)
+        .execute_batch_action(&action, None, serde_json::json!({}))
+        .await;
+    assert!(
+        res.is_err(),
+        "non-allowlisted internal target must still be refused"
+    );
+    let err = res.unwrap_err();
+    assert!(
+        err.contains("SSRF") && err.contains("ALLOWED_HOSTNAMES"),
+        "the delivery error must surface the resolver's reason, got: {err}"
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the refused delivery must never reach the server"
+    );
+}
+
 // =============================================================================
 // Audit 2, A6 — static bearer-token authentication
 // =============================================================================

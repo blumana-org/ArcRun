@@ -22,6 +22,12 @@ pub fn validate_webhook_url(url_str: &str) -> Result<(), String> {
 /// vetted here against [`is_internal_ip`]; domain hosts are only checked against
 /// the configured blocklists — the IP a domain *resolves* to is enforced at
 /// delivery time by the DNS resolver in [`crate::action`] (anti-DNS-rebinding).
+///
+/// Allowlists win over every block rule: a host matching
+/// `SecurityConfig::allowed_hostnames` passes as soon as the scheme is http(s), and
+/// an IP literal inside `SecurityConfig::allowed_cidrs` skips the internal-range
+/// check (the hostname blocklists still apply to it, since they match on the
+/// textual host — e.g. `0.0.0.0`).
 pub fn validate_webhook_url_with_config(
     url_str: &str,
     config: &SecurityConfig,
@@ -55,6 +61,12 @@ pub fn validate_webhook_url_with_config(
 
     let host_lower = host.to_lowercase();
 
+    // Explicitly trusted hostname (internal service the operator vouches for):
+    // nothing below applies, and the delivery-time resolver skips it as well.
+    if is_allowed_hostname(&host_lower, config) {
+        return Ok(());
+    }
+
     // Check against configurable blocked hostnames
     for blocked in &config.blocked_hostnames {
         let blocked_lower = blocked.to_lowercase();
@@ -71,20 +83,19 @@ pub fn validate_webhook_url_with_config(
     // (e.g. `[::1]`, `[fd00::1]`, `[::ffff:10.0.0.1]`) are actually inspected —
     // `host_str().parse::<IpAddr>()` always failed on the bracketed form and let
     // them through in release (Audit 2, A5).
-    match url.host() {
-        Some(Host::Ipv4(ip)) if is_internal_ip(&IpAddr::V4(ip)) => {
-            return Err(format!(
-                "URL points to internal IP address '{}' which is not allowed",
-                ip
-            ));
-        }
-        Some(Host::Ipv6(ip)) if is_internal_ip(&IpAddr::V6(ip)) => {
-            return Err(format!(
-                "URL points to internal IP address '{}' which is not allowed",
-                ip
-            ));
-        }
-        _ => {}
+    let literal = match url.host() {
+        Some(Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
+        Some(Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
+        _ => None,
+    };
+    if let Some(ip) = literal
+        && is_internal_ip(&ip)
+        && !is_allowed_ip(&ip, config)
+    {
+        return Err(format!(
+            "URL points to internal IP address '{}' which is not allowed",
+            ip
+        ));
     }
 
     // Check against configurable blocked hostname suffixes
@@ -161,14 +172,36 @@ pub(crate) fn is_internal_ip(ip: &IpAddr) -> bool {
     }
 }
 
+/// Does `host_lower` (already lowercased) match an `allowed_hostnames` entry?
+/// Entries are exact names, or leading-dot suffixes (`.svc.cluster.local`).
+pub(crate) fn is_allowed_hostname(host_lower: &str, config: &SecurityConfig) -> bool {
+    config.allowed_hostnames.iter().any(|entry| {
+        let entry = entry.trim().to_lowercase();
+        if entry.is_empty() {
+            false
+        } else if let Some(suffix) = entry.strip_prefix('.') {
+            host_lower
+                .strip_suffix(suffix)
+                .is_some_and(|rest| rest.ends_with('.'))
+        } else {
+            host_lower == entry
+        }
+    })
+}
+
+/// Is `ip` inside one of the operator-trusted `allowed_cidrs` networks?
+pub(crate) fn is_allowed_ip(ip: &IpAddr, config: &SecurityConfig) -> bool {
+    config.allowed_cidrs.iter().any(|net| net.contains(ip))
+}
+
 /// Pure filter used by the delivery-time DNS resolver (Audit 2, A5, anti-rebinding):
 /// given the IPs a hostname resolved to, returns `Err(offending_ip)` if **any**
-/// is internal/reserved. A hostname that resolves to a mix of public and internal
-/// IPs is rejected (the safe choice — an attacker could otherwise smuggle an
-/// internal target alongside a public one).
-pub(crate) fn check_resolved_ips(ips: &[IpAddr]) -> Result<(), IpAddr> {
+/// is internal/reserved and not inside an allowed CIDR. A hostname that resolves
+/// to a mix of public and internal IPs is rejected (the safe choice — an attacker
+/// could otherwise smuggle an internal target alongside a public one).
+pub(crate) fn check_resolved_ips(ips: &[IpAddr], config: &SecurityConfig) -> Result<(), IpAddr> {
     for ip in ips {
-        if is_internal_ip(ip) {
+        if is_internal_ip(ip) && !is_allowed_ip(ip, config) {
             return Err(*ip);
         }
     }
@@ -321,6 +354,8 @@ mod tests {
     #[test]
     fn test_check_resolved_ips_filter() {
         use std::net::Ipv6Addr;
+        let cfg = strict_security_config();
+        let check_resolved_ips = |ips: &[IpAddr]| check_resolved_ips(ips, &cfg);
         // All-public → Ok.
         assert!(
             check_resolved_ips(&[
@@ -362,5 +397,69 @@ mod tests {
         assert!(validate_webhook_url_with_config("http://localhost/api", &config).is_ok());
         // But internal IPs are still blocked (hardcoded check)
         assert!(validate_webhook_url_with_config("http://10.0.0.1/api", &config).is_err());
+    }
+
+    fn allowlisted_config(hosts: &[&str], cidrs: &[&str]) -> SecurityConfig {
+        SecurityConfig {
+            skip_ssrf_validation: false,
+            allowed_hostnames: hosts.iter().map(|h| h.to_string()).collect(),
+            allowed_cidrs: crate::config::parse_cidr_list("ALLOWED_CIDRS", &cidrs.join(","))
+                .unwrap(),
+            ..SecurityConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_allowed_hostname_exact_and_suffix() {
+        let cfg = allowlisted_config(&["backend", ".svc.cluster.local"], &[]);
+        // Exact match, case-insensitive, beats the default blocklists (`.local`).
+        assert!(validate_webhook_url_with_config("http://backend:8000/hook", &cfg).is_ok());
+        assert!(validate_webhook_url_with_config("http://BACKEND/hook", &cfg).is_ok());
+        assert!(validate_webhook_url_with_config("http://api.svc.cluster.local/h", &cfg).is_ok());
+        // Suffix needs a dot boundary and is not an exact match.
+        assert!(validate_webhook_url_with_config("http://svc.cluster.local/h", &cfg).is_err());
+        assert!(validate_webhook_url_with_config("http://evilsvc.cluster.local/h", &cfg).is_err());
+        // Blocked names and internal literals stay blocked.
+        assert!(validate_webhook_url_with_config("http://localhost/hook", &cfg).is_err());
+        assert!(validate_webhook_url_with_config("http://10.0.0.1/hook", &cfg).is_err());
+        // Scheme is still enforced for allowlisted hosts.
+        assert!(validate_webhook_url_with_config("ftp://backend/hook", &cfg).is_err());
+    }
+
+    #[test]
+    fn test_allowed_cidr_permits_internal_literal() {
+        let cfg = allowlisted_config(&[], &["10.42.0.0/16", "192.168.1.10"]);
+        assert!(validate_webhook_url_with_config("http://10.42.3.4:8000/hook", &cfg).is_ok());
+        assert!(validate_webhook_url_with_config("http://192.168.1.10/hook", &cfg).is_ok());
+        // Outside the allowed networks: still internal, still blocked.
+        assert!(validate_webhook_url_with_config("http://10.43.0.1/hook", &cfg).is_err());
+        assert!(validate_webhook_url_with_config("http://192.168.1.11/hook", &cfg).is_err());
+        assert!(validate_webhook_url_with_config("http://127.0.0.1/hook", &cfg).is_err());
+        // An IPv4-mapped v6 literal inside an allowed v4 range is NOT matched by
+        // a v4 network (ipnet compares families) — it stays blocked, which is the
+        // conservative outcome.
+        assert!(validate_webhook_url_with_config("http://[::ffff:10.42.0.1]/hook", &cfg).is_err());
+        // CIDRs do not loosen the textual hostname blocklist.
+        assert!(validate_webhook_url_with_config("http://localhost/hook", &cfg).is_err());
+    }
+
+    #[test]
+    fn test_check_resolved_ips_honours_allowed_cidrs() {
+        let cfg = allowlisted_config(&[], &["10.42.0.0/16"]);
+        let inside = IpAddr::V4(Ipv4Addr::new(10, 42, 1, 1));
+        let outside = IpAddr::V4(Ipv4Addr::new(10, 43, 1, 1));
+        assert!(check_resolved_ips(&[inside], &cfg).is_ok());
+        assert!(check_resolved_ips(&[IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), inside], &cfg).is_ok());
+        assert_eq!(check_resolved_ips(&[inside, outside], &cfg), Err(outside));
+    }
+
+    #[test]
+    fn test_is_allowed_hostname_matching() {
+        let cfg = allowlisted_config(&["Backend", ".Svc.Cluster.Local", " "], &[]);
+        assert!(is_allowed_hostname("backend", &cfg));
+        assert!(!is_allowed_hostname("backend.example.com", &cfg));
+        assert!(is_allowed_hostname("a.b.svc.cluster.local", &cfg));
+        assert!(!is_allowed_hostname("svc.cluster.local", &cfg));
+        assert!(!is_allowed_hostname("", &cfg));
     }
 }

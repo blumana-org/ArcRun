@@ -163,6 +163,14 @@ fn init_security(config: &Config) {
     validation::init_limits_config(config.limits);
     if config.security.skip_ssrf_validation {
         log::warn!("SSRF validation is disabled - this should only be used in development!");
+    } else if !config.security.allowed_hostnames.is_empty()
+        || !config.security.allowed_cidrs.is_empty()
+    {
+        log::info!(
+            "SSRF allowlist active: hostnames {:?}, networks {:?}",
+            config.security.allowed_hostnames,
+            config.security.allowed_cidrs
+        );
     }
 }
 

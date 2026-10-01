@@ -171,19 +171,30 @@ pub struct ActionExecutor {
 /// if any is internal, resolution fails, the delivery errors, and the outbox retries
 /// it later (the existing at-least-once behaviour).
 ///
+/// Operator allowlists (`ALLOWED_HOSTNAMES` / `ALLOWED_CIDRS`) are honoured here
+/// too: an allowlisted hostname is resolved without any IP check, and resolved IPs
+/// inside an allowed CIDR are accepted even though they are private. Without them,
+/// every webhook to an internal docker/k8s service name fails at delivery while
+/// passing creation-time validation (the name is not on any blocklist).
+///
 /// Scope / non-goals:
 /// - **IP-literal URLs never reach this resolver.** reqwest's connector handles a
 ///   literal host directly without DNS, so `http://169.254.169.254/` is caught only
 ///   by the creation-time check (which now also handles IPv6 literals, A5 fix 1).
 /// - **Blocked hostnames / suffixes stay a creation-time concern.** This resolver
-///   filters purely on the resolved IP, never on the name.
-#[derive(Debug, Clone, Copy)]
-struct SsrfGuardResolver;
+///   filters purely on the resolved IP, never on the name (allowlist aside).
+#[derive(Debug, Clone)]
+struct SsrfGuardResolver {
+    security: std::sync::Arc<SecurityConfig>,
+}
 
 impl reqwest::dns::Resolve for SsrfGuardResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let security = self.security.clone();
         Box::pin(async move {
             let host = name.as_str().to_owned();
+            let allowlisted =
+                crate::validation::is_allowed_hostname(&host.to_lowercase(), &security);
             // getaddrinfo blocks — run it on the blocking pool. Port 0: reqwest
             // overrides the port from the URL afterwards.
             let addrs: Vec<std::net::SocketAddr> = tokio::task::spawn_blocking(move || {
@@ -195,14 +206,17 @@ impl reqwest::dns::Resolve for SsrfGuardResolver {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-            let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
-            if let Err(bad) = crate::validation::check_resolved_ips(&ips) {
-                return Err(format!(
-                    "SSRF: '{}' resolved to internal/reserved IP {} — refusing to connect",
-                    name.as_str(),
-                    bad
-                )
-                .into());
+            if !allowlisted {
+                let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
+                if let Err(bad) = crate::validation::check_resolved_ips(&ips, &security) {
+                    return Err(format!(
+                        "SSRF: '{}' resolved to internal/reserved IP {} — refusing to connect \
+                         (allow it via ALLOWED_HOSTNAMES or ALLOWED_CIDRS if this target is trusted)",
+                        name.as_str(),
+                        bad
+                    )
+                    .into());
+                }
             }
 
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
@@ -232,7 +246,9 @@ impl ActionExecutor {
             ))
             .redirect(reqwest::redirect::Policy::none());
         if !security.skip_ssrf_validation {
-            builder = builder.dns_resolver(SsrfGuardResolver);
+            builder = builder.dns_resolver(SsrfGuardResolver {
+                security: std::sync::Arc::new(security.clone()),
+            });
         }
         let client = builder.build().expect("Failed to build HTTP client");
         Self { ctx, client }
@@ -353,7 +369,7 @@ impl ActionExecutor {
                 "failure",
                 started_at.elapsed().as_secs_f64(),
             );
-            format!("Failed to send request: {}", e)
+            format!("Failed to send request: {}", error_chain(&e))
         })?;
         let status = response.status();
         if status.is_redirection() {
@@ -441,7 +457,8 @@ async fn read_response_body_limited(response: reqwest::Response) -> Result<(Stri
     let mut truncated = false;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Failed to read webhook response: {e}"))?;
+        let chunk =
+            chunk.map_err(|e| format!("Failed to read webhook response: {}", error_chain(&e)))?;
         let remaining = MAX_WEBHOOK_RESPONSE_BYTES.saturating_sub(body.len());
         if chunk.len() > remaining {
             body.extend_from_slice(&chunk[..remaining]);
@@ -452,4 +469,58 @@ async fn read_response_body_limited(response: reqwest::Response) -> Result<(Stri
     }
 
     Ok((String::from_utf8_lossy(&body).into_owned(), truncated))
+}
+
+/// Render an error with its full `source()` chain (`a: b: c`). reqwest's `Display`
+/// stops at "error sending request for url (...)" and hides the actual cause — a
+/// refused SSRF resolution, a connect timeout, a TLS failure — which made webhook
+/// failures undiagnosable from the logs.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut cur = err.source();
+    while let Some(src) = cur {
+        let msg = src.to_string();
+        if !out.ends_with(&msg) {
+            out.push_str(": ");
+            out.push_str(&msg);
+        }
+        cur = src.source();
+    }
+    out
+}
+
+#[cfg(test)]
+mod error_chain_tests {
+    use super::error_chain;
+
+    #[derive(Debug)]
+    struct Leaf;
+    impl std::fmt::Display for Leaf {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "resolved to internal IP")
+        }
+    }
+    impl std::error::Error for Leaf {}
+
+    #[derive(Debug)]
+    struct Mid(Leaf);
+    impl std::fmt::Display for Mid {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "dns error")
+        }
+    }
+    impl std::error::Error for Mid {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn renders_every_level() {
+        assert_eq!(
+            error_chain(&Mid(Leaf)),
+            "dns error: resolved to internal IP"
+        );
+        assert_eq!(error_chain(&Leaf), "resolved to internal IP");
+    }
 }

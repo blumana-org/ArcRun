@@ -250,6 +250,21 @@ pub struct SecurityConfig {
     /// List of blocked hostname suffixes (e.g., ".local", ".internal")
     pub blocked_hostname_suffixes: Vec<String>,
 
+    /// Webhook hostnames explicitly trusted despite SSRF protection (env
+    /// `ALLOWED_HOSTNAMES`). An entry is either an exact hostname (`backend`,
+    /// `api.svc.cluster.local`) or a leading-dot suffix (`.svc.cluster.local`).
+    /// Matching is case-insensitive. An allowlisted hostname skips the hostname
+    /// blocklists at creation time AND the resolved-IP check in the delivery-time
+    /// resolver: the operator is vouching for whatever the name resolves to
+    /// (typically an internal docker/k8s service). Empty by default.
+    pub allowed_hostnames: Vec<String>,
+
+    /// IP networks explicitly trusted despite being private/reserved (env
+    /// `ALLOWED_CIDRS`, e.g. `10.42.0.0/16,192.168.1.10`). A bare IP means a
+    /// single-host network. Applies to IP-literal URLs at creation time and to
+    /// every IP a hostname resolves to at delivery time. Empty by default.
+    pub allowed_cidrs: Vec<ipnet::IpNet>,
+
     /// Optional static bearer token for API authentication (Audit 2, A6).
     ///
     /// `None`/empty (env `AUTH_TOKEN` unset or blank) ⇒ authentication is
@@ -367,6 +382,8 @@ impl Default for SecurityConfig {
                 ".localdomain".to_string(),
                 ".localhost".to_string(),
             ],
+            allowed_hostnames: Vec::new(),
+            allowed_cidrs: Vec::new(),
             auth_token: None,
         }
     }
@@ -423,6 +440,8 @@ impl Config {
     /// - `SKIP_SSRF_VALIDATION`: Skip SSRF validation (default: 1 in debug, 0 in release)
     /// - `BLOCKED_HOSTNAMES`: Comma-separated list of blocked hostnames (default: localhost,127.0.0.1,::1,0.0.0.0,local,internal)
     /// - `BLOCKED_HOSTNAME_SUFFIXES`: Comma-separated list of blocked hostname suffixes (default: .local,.internal,.localdomain,.localhost)
+    /// - `ALLOWED_HOSTNAMES`: Comma-separated webhook hostnames (exact, or `.suffix`) trusted despite SSRF protection — skips blocklists and the delivery-time resolved-IP check (default: empty)
+    /// - `ALLOWED_CIDRS`: Comma-separated IP networks (CIDR or bare IP) trusted despite being private/reserved, at creation time and in the delivery-time resolver (default: empty)
     /// - `AUTH_TOKEN`: Optional static bearer token; when set, all endpoints except `/health` and `/ready` require `Authorization: Bearer <token>` (default: unset ⇒ auth disabled)
     /// - `MAX_TASKS_PER_BATCH`: Max tasks accepted in one POST /task batch (default: 1000)
     /// - `MAX_DEPS_PER_TASK`: Max dependencies a single task may declare (default: 100)
@@ -522,6 +541,11 @@ impl Config {
                 }
                 suffixes
             },
+            allowed_hostnames: parse_csv_env("ALLOWED_HOSTNAMES"),
+            allowed_cidrs: parse_cidr_list(
+                "ALLOWED_CIDRS",
+                &std::env::var("ALLOWED_CIDRS").unwrap_or_default(),
+            )?,
             // Trim and treat a blank value as "unset" so `AUTH_TOKEN=` disables
             // auth rather than requiring an empty-string token.
             auth_token: std::env::var("AUTH_TOKEN").ok().and_then(|t| {
@@ -795,5 +819,66 @@ fn parse_env_or_f64(name: &str, default: f64) -> Result<f64, ConfigError> {
             message: format!("Invalid value '{}', expected a valid decimal number", val),
         }),
         Err(_) => Ok(default),
+    }
+}
+
+/// Comma-separated env list: trimmed, empty entries dropped, unset ⇒ empty.
+fn parse_csv_env(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse a comma-separated list of IP networks. Each entry is a CIDR
+/// (`10.0.0.0/8`, `fd00::/8`) or a bare IP, which becomes a single-host network
+/// (`/32` or `/128`). `field` names the env var in the error.
+pub fn parse_cidr_list(field: &str, raw: &str) -> Result<Vec<ipnet::IpNet>, ConfigError> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|entry| {
+            entry
+                .parse::<ipnet::IpNet>()
+                .or_else(|_| entry.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+                .map_err(|_| ConfigError {
+                    field: field.to_string(),
+                    message: format!("'{entry}' is not a valid IP address or CIDR network"),
+                })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cidr_list_accepts_cidrs_and_bare_ips() {
+        let nets =
+            parse_cidr_list("X", " 10.42.0.0/16, 192.168.1.10 ,fd00::/8,, 2001:db8::1 ").unwrap();
+        assert_eq!(nets.len(), 4);
+        assert!(nets[0].contains(&"10.42.7.7".parse::<std::net::IpAddr>().unwrap()));
+        // A bare IP becomes a single-host network.
+        assert_eq!(nets[1].prefix_len(), 32);
+        assert!(nets[1].contains(&"192.168.1.10".parse::<std::net::IpAddr>().unwrap()));
+        assert!(!nets[1].contains(&"192.168.1.11".parse::<std::net::IpAddr>().unwrap()));
+        assert_eq!(nets[3].prefix_len(), 128);
+    }
+
+    #[test]
+    fn parse_cidr_list_empty_and_invalid() {
+        assert!(parse_cidr_list("X", "").unwrap().is_empty());
+        assert!(parse_cidr_list("X", " , ").unwrap().is_empty());
+        let err = parse_cidr_list("ALLOWED_CIDRS", "10.0.0.0/8,backend").unwrap_err();
+        assert_eq!(err.field, "ALLOWED_CIDRS");
+        assert!(err.message.contains("backend"));
+        assert!(parse_cidr_list("X", "10.0.0.0/33").is_err());
     }
 }

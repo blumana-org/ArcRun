@@ -346,6 +346,7 @@ dependencies = [
  "dotenvy",
  "env_logger",
  "futures-util",
+ "ipnet",
  "libc",
  "log",
  "mimalloc",

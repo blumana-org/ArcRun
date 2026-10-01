@@ -14,7 +14,7 @@ pub use action::validate_action_params;
 pub use ssrf::{validate_webhook_url, validate_webhook_url_with_config};
 
 // Internal SSRF helper shared with the delivery-time DNS resolver (Audit 2, A5).
-pub(crate) use ssrf::check_resolved_ips;
+pub(crate) use ssrf::{check_resolved_ips, is_allowed_hostname};
 pub use task::{
     validate_batch_meta, validate_new_task, validate_rules, validate_task_batch,
     validate_update_task, validate_update_task_counters,
