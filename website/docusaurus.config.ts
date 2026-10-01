@@ -14,10 +14,10 @@ const config: Config = {
     v4: true,
   },
 
-  // GitHub Pages: https://tinyest-org.github.io/ArcRun/
-  url: 'https://tinyest-org.github.io',
+  // GitHub Pages: https://blumana-org.github.io/ArcRun/
+  url: 'https://blumana-org.github.io',
   baseUrl: '/ArcRun/',
-  organizationName: 'tinyest-org',
+  organizationName: 'blumana-org',
   projectName: 'ArcRun',
   trailingSlash: false,
 
@@ -47,7 +47,7 @@ const config: Config = {
           path: '../docs',
           routeBasePath: '/docs',
           sidebarPath: './sidebars.ts',
-          editUrl: 'https://github.com/tinyest-org/ArcRun/tree/master/',
+          editUrl: 'https://github.com/blumana-org/ArcRun/tree/master/',
           // Internal working documents (plans, audits, handoff notes) are not
           // part of the published documentation.
           exclude: [
@@ -90,7 +90,7 @@ const config: Config = {
           position: 'right',
         },
         {
-          href: 'https://github.com/tinyest-org/ArcRun',
+          href: 'https://github.com/blumana-org/ArcRun',
           label: 'GitHub',
           position: 'right',
         },
@@ -118,7 +118,7 @@ const config: Config = {
         {
           title: 'More',
           items: [
-            {label: 'GitHub', href: 'https://github.com/tinyest-org/ArcRun'},
+            {label: 'GitHub', href: 'https://github.com/blumana-org/ArcRun'},
             {label: 'Docker Hub', href: 'https://hub.docker.com/r/plawn/arcrun'},
           ],
         },

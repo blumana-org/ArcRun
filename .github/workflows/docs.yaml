@@ -1,7 +1,7 @@
 name: Docs
 
 # Builds the Docusaurus site (website/) from docs/ and publishes it to
-# GitHub Pages: https://tinyest-org.github.io/ArcRun/
+# GitHub Pages: https://blumana-org.github.io/ArcRun/
 #
 # One-time setup: Settings > Pages > Source must be set to "GitHub Actions".
 
