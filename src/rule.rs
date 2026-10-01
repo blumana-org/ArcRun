@@ -13,9 +13,9 @@ use utoipa::ToSchema;
 /// A concurrency control strategy. Discriminated by the `type` JSON field.
 ///
 /// Two types are supported:
-/// - `Concurency`: at most N tasks matching the criteria can be Running simultaneously.
-/// - `Capacity`: the total remaining work (sum of `expected_count - success - failures`)
-///   across Running tasks matching the criteria must be below a threshold.
+/// - `Concurency`: limits Claimed/Running tasks admitted through the same reservation key.
+/// - `Capacity`: admits a task when the existing reserved remaining work is below a threshold.
+///   The candidate charge is added after this check, so the total may exceed the threshold.
 ///   `matcher.status` must be `Running`, and tasks using Capacity must set `expected_count`.
 ///
 /// Both can be combined on the same task (AND semantics: all rules must pass).
@@ -48,10 +48,10 @@ use utoipa::ToSchema;
 #[derive(Debug, Clone, Serialize, PartialEq, Deserialize, Hash, Eq, ToSchema)]
 #[serde(tag = "type")]
 pub enum Strategy {
-    /// Limits the number of concurrent Running tasks matching specific criteria.
+    /// Limits concurrent claims admitted through the same reservation key.
     Concurency(ConcurencyRule),
-    /// Limits the total remaining work across Running tasks matching specific criteria.
-    /// The candidate is allowed if `sum(remaining) < max_capacity`.
+    /// Gates admission on remaining work reserved through the same key.
+    /// The candidate is allowed when the existing charge is below max_capacity.
     Capacity(CapacityRule),
 }
 
@@ -61,30 +61,27 @@ pub enum Strategy {
 #[derive(Default)]
 pub struct Rules(pub Vec<Strategy>);
 
-/// Defines a concurrency limit: "at most `max_concurency` tasks matching `matcher` can run simultaneously."
+/// Limits the number of Claimed/Running tasks admitted through the same matcher key.
 #[derive(Debug, Clone, Serialize, PartialEq, Deserialize, Hash, Eq, ToSchema)]
 pub struct ConcurencyRule {
     /// Maximum number of concurrent tasks allowed. Must be a positive integer.
     /// Example: 1 means "only one at a time" (mutual exclusion).
     pub max_concurency: i32,
-    /// Criteria for which Running tasks count toward the limit.
+    /// Matcher used to build the shared reservation key. Matching tasks without this rule do not count.
     pub matcher: Matcher,
 }
 
-/// Defines a capacity limit: "the total remaining work across Running tasks matching `matcher`
-/// must be below `max_capacity` for a new task to start."
+/// Admits a task when the existing capacity charge under the matcher key is below max_capacity.
 ///
 /// `remaining(task) = GREATEST(COALESCE(expected_count, 0) - success - failures, 0)`
 ///
-/// The candidate's own `expected_count` is NOT counted in the sum — only already-Running
-/// (and Claimed) tasks are. The candidate MUST have `expected_count` set (non-null),
+/// The candidate charge is added after admission; only existing reservations count in the check. The candidate MUST have `expected_count` set (non-null),
 /// otherwise it is blocked. `matcher.status` must be `Running`.
 #[derive(Debug, Clone, Serialize, PartialEq, Deserialize, Hash, Eq, ToSchema)]
 pub struct CapacityRule {
-    /// Max total remaining allowed for Running tasks matching the criteria.
-    /// The candidate is allowed if `sum_running < max_capacity`.
+    /// Admission threshold for existing reserved work. Adding a candidate may exceed this value.
     pub max_capacity: i32,
-    /// Criteria for which Running tasks count toward the capacity sum.
+    /// Matcher used to build the capacity reservation key. Only claims through this key count.
     pub matcher: Matcher,
 }
 

@@ -1,20 +1,25 @@
 import type {SidebarsConfig} from '@docusaurus/plugin-content-docs';
 
-// Explicit ordering of the repository's docs/ folder. Doc ids are the file
-// names (without extension); labels come from each file's H1.
+// Pages are served directly from the repository's docs/ directory.
 const sidebars: SidebarsConfig = {
   docs: [
     {
       type: 'category',
-      label: 'Guide',
+      label: 'Guides',
       collapsed: false,
-      items: ['openapi_description', 'concepts', 'api', 'configuration', 'metrics'],
+      items: ['getting-started', 'concepts', 'webhooks'],
     },
     {
       type: 'category',
-      label: 'Internals',
+      label: 'Reference',
       collapsed: false,
-      items: ['architecture', 'workers', 'webhooks'],
+      items: ['api', 'configuration', 'metrics', 'openapi_description'],
+    },
+    {
+      type: 'category',
+      label: 'Implementation',
+      collapsed: false,
+      items: ['architecture', 'workers'],
     },
   ],
 };

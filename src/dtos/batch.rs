@@ -25,7 +25,7 @@ pub struct BatchSummaryDto {
     /// Structured metadata attached to the batch (`{}` when none was set).
     pub metadata: serde_json::Value,
     /// Number of tasks not yet terminal, from the denormalized `batch.remaining`
-    /// counter (Audit 2, D2). `0` means the batch is complete. `null` for batches
+    /// counter. `0` means the batch is complete. `null` for batches
     /// that have no `batch` row (no on_batch_complete / scope / metadata was set —
     /// such batches are tracked only via `task.batch_id`, so no counter exists).
     pub remaining: Option<i32>,
@@ -121,7 +121,7 @@ pub struct StopBatchResponseDto {
     pub canceled_waiting: i64,
     /// Number of Pending tasks that were canceled.
     pub canceled_pending: i64,
-    /// Number of Claimed tasks that were canceled (on_start not yet called).
+    /// Number of Claimed tasks that were canceled (on_start may be in flight).
     pub canceled_claimed: i64,
     /// Number of Running tasks that were canceled (cancel webhooks fired if registered).
     pub canceled_running: i64,

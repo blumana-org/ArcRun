@@ -1,78 +1,38 @@
-# ArcRun - Task Orchestration Service
+# ArcRun API Overview
 
-A webhook-based task scheduler that executes DAGs (Directed Acyclic Graphs) of tasks with concurrency control.
+ArcRun orchestrates tasks executed by external HTTP services. It stores dependencies, schedules eligible work, enforces concurrency and capacity rules, and delivers lifecycle notifications.
 
-## Core Workflow
+## Execution flow
 
-1. **Create a batch** of tasks via `POST /task` with an array of `NewTaskDto`. Each task has a local `id` (string, your choice) used to wire dependencies within the batch. The server assigns real UUIDs and returns them. The response includes an `X-Batch-ID` header grouping all tasks.
-2. **The worker loop** (server-side, automatic) picks up `Pending` tasks, checks concurrency rules, and calls each task's `on_start` webhook. The webhook URL receives a `?handle=<host>/task/<uuid>` query parameter -- this is the callback URL your service must use to report completion.
-3. **Report completion** by calling `PATCH /task/{task_id}` with `{"status": "Success"}` or `{"status": "Failure", "failure_reason": "..."}`. Only `Success` and `Failure` are valid status transitions via the API.
-4. **Dependency propagation** happens automatically: when a parent succeeds, its children's counters decrement; when all counters reach zero, the child becomes `Pending`. When a parent fails and `requires_success` was true on the link, the child (and its descendants) are marked as `Failure`.
+1. Create tasks with `POST /task`. Send an array of task definitions, or an object containing `tasks` and optional batch identity and completion actions.
+2. Reference earlier tasks by their local IDs to declare dependencies. The response contains server-assigned task UUIDs and an `X-Batch-ID` header.
+3. ArcRun claims eligible tasks and calls their required `on_start` webhook. The `handle` query parameter contains the task's completion URL.
+4. The receiver accepts the request and performs the work. It reports `Success` or `Failure` through `PATCH /task/{task_id}`; failure requires a reason.
+5. ArcRun commits the result, dependency propagation, and end-notification queueing in one transaction. Notification HTTP calls happen asynchronously.
 
-## Task States
+## Authentication
 
-| State | Meaning |
-|-------|---------|
-| `Waiting` | Has unmet dependencies -- will transition to `Pending` automatically when parents complete |
-| `Pending` | Ready to run -- the worker loop will pick it up and call its `on_start` webhook |
-| `Running` | `on_start` webhook has been called -- waiting for external completion report |
-| `Success` | Completed successfully (set via API) |
-| `Failure` | Failed -- either reported via API, timed out, or failed due to parent failure |
-| `Paused` | Manually paused via `PATCH /task/pause/{task_id}` -- worker ignores it |
-| `Canceled` | Manually canceled via `DELETE /task/{task_id}` -- treated like Failure for propagation |
+When `AUTH_TOKEN` is configured, send `Authorization: Bearer <token>` on every request except `/health` and `/ready`. This includes callback requests, metrics, Swagger, and the DAG viewer. The callback URL contains no credential. Authentication is disabled when the token is unset or blank.
 
-## PATCH vs PUT for Updates
+## Updates
 
-- **`PATCH /task/{task_id}`**: Synchronous update. Use this to set final status (`Success`/`Failure`). Triggers `on_success`/`on_failure` webhooks and dependency propagation immediately.
-- **`PUT /task/{task_id}`**: Batched counter update. Use this for high-throughput incremental `new_success`/`new_failures` counter bumps. Updates are accumulated and flushed periodically (not immediately). At least one of `new_success` or `new_failures` must be non-zero.
+| Endpoint | Contract |
+|----------|----------|
+| `PATCH /task/{task_id}` | Updates a Running/Claimed task synchronously. Can commit progress with a final Success/Failure result. Repeating the same final status returns `200` without applying changes again; conflicting states return `409`. |
+| `PUT /task/{task_id}` | Queues non-negative progress increments in memory. At least one counter must be positive. `202` acknowledges queueing, not persistence or task existence. Other fields are ignored. |
 
-## Webhooks
+Item counters do not automatically complete tasks. A task's timeout measures inactivity since its last persisted update while Running.
 
-When the worker starts a task, it calls the `on_start` webhook with a `?handle=<callback_url>` query parameter. Your webhook handler can optionally return a `NewActionDto` JSON body to register a cancel action.
+## States and scheduling
 
-Each webhook request includes these headers for idempotency and diagnostics:
-- `Idempotency-Key`: `"<task_id>:start"`, `"<task_id>:end:success"`, `"<task_id>:end:failure"`, or `"<task_id>:cancel"`
-- `X-Task-Id`: task UUID
-- `X-Task-Trigger`: `start`, `end`, or `cancel`
+Tasks move through Waiting, Pending, Claimed, and Running before reaching Success, Failure, or Canceled. Pending/Waiting tasks can be paused and explicitly resumed. Paused tasks still receive dependency updates.
 
-Webhook params are stored as JSON in the `params` field of `NewActionDto`:
-```json
-{"kind": "Webhook", "params": {"url": "https://my-service.com/run", "verb": "Post", "body": {"key": "value"}, "headers": {"Authorization": "Bearer xxx"}}}
-```
+Rules reserve shared database slots at claim time. Concurrency limits count claims through the same rule key. Capacity limits check existing reserved work before adding a candidate, so the total can exceed the admission threshold.
 
-## Concurrency Rules
+## Webhook delivery
 
-Tasks can have `rules` (array of `Strategy`) that limit concurrent execution.
+Start webhooks are synchronous within the start worker. End, cancel, and batch-complete notifications use a durable queue with retries. Duplicate HTTP delivery is possible; receivers should deduplicate using the `Idempotency-Key` header and their action identity.
 
-A `Concurency` rule specifies: match currently `Running` tasks by `kind` and metadata `fields`, and block if `max_concurency` is reached. Fields are keys in the task's `metadata` JSON -- two tasks match if they share the same values for all listed fields.
+Persistent delivery failures become `exhausted` after the configured retry limit. Inspect them with `GET /webhook-deliveries?status=exhausted`. A batch-complete event is enqueued once when all inserted tasks are terminal; this does not imply exactly-once HTTP delivery.
 
-A `Capacity` rule limits total remaining work across matching Running (and Claimed) tasks. Remaining work is `max(coalesce(expected_count, 0) - success - failures, 0)`; tasks without `expected_count` contribute `0`. Tasks that use Capacity rules must set `expected_count`, and `matcher.status` must be `Running`.
-
-## Deduplication
-
-`dedupe_strategy` on `NewTaskDto` allows skipping task creation if a matching task already exists. Each `Matcher` specifies a `status`, `kind`, and `fields` (metadata keys) to match against.
-
-## Minimal Example
-
-Create two tasks where `deploy` depends on `build`:
-```json
-[
-  {
-    "id": "build",
-    "name": "Build App",
-    "kind": "ci",
-    "timeout": 300,
-    "on_start": {"kind": "Webhook", "params": {"url": "https://ci.example.com/build", "verb": "Post"}}
-  },
-  {
-    "id": "deploy",
-    "name": "Deploy App",
-    "kind": "cd",
-    "timeout": 600,
-    "on_start": {"kind": "Webhook", "params": {"url": "https://cd.example.com/deploy", "verb": "Post"}},
-    "dependencies": [{"id": "build", "requires_success": true}],
-    "on_success": [{"kind": "Webhook", "params": {"url": "https://slack.example.com/notify", "verb": "Post", "body": {"text": "Deploy succeeded"}}}]
-  }
-]
-```
-The `build` task starts as `Pending` (no deps), `deploy` starts as `Waiting`. Once `build` succeeds, `deploy` transitions to `Pending` and the worker starts it.
+The documentation site provides a getting-started walkthrough, full API and configuration references, webhook receiver guidance, and architecture details. This overview is also embedded in the generated OpenAPI description.

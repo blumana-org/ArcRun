@@ -1,87 +1,91 @@
-# Worker Loops & Rules
+# Background Workers
 
-There are five background workers (spawned in `src/main.rs::spawn_workers`): `start_loop`, `timeout_loop`, `batch_updater`, `retention_cleanup_loop`, and `delivery_loop`. All share the same `watch::Receiver<bool>` shutdown channel.
+The server starts six background workers. Each receives a shared shutdown signal. Timing and batch limits are described in [Configuration](configuration.md).
 
-See also: [architecture.md](architecture.md) (lifecycle, code map, schema), [webhooks.md](webhooks.md) (delivery loop detail, outbox contract).
+| Worker | Purpose | Default cadence |
+|--------|---------|-----------------|
+| Start | Admit Pending tasks and call `on_start` | 1 second, plus wakeups |
+| Timeout | Requeue stale claims and fail inactive Running tasks | 1 second |
+| Counter updater | Persist queued progress increments | 100 ms |
+| Delivery | Send queued end, cancel, and batch notifications | 1 second, plus wakeups |
+| Retention | Clean unused rule slots and archive/purge eligible tasks | 1 hour |
+| Metrics sampler | Refresh task and connection-pool gauges | 15 seconds |
 
-## In-process nudges (Audit 2, B4)
+Cadences are waits between iterations, not execution deadlines. Database and HTTP work can lengthen an iteration.
 
-To avoid every DAG edge paying a full poll tick, handlers and workers wake the `start`/`delivery` loops immediately via a shared `WorkerNudges` (two `tokio::sync::Notify`, held in `AppState` and passed to `spawn_workers`). After a committing transition, producers `notify_one` the relevant loop (`add_task`/`resume_task` → start; `update_task`/`cancel_task`/`stop_batch`/timeout+on_start failures → delivery; a real `update_task`/`cancel` transition → both) and the loop runs one extra iteration instead of waiting the interval. `notify_one` stores a permit, so a nudge fired mid-iteration is never lost. The nudge is **best-effort — the poll (`WORKER_LOOP_INTERVAL_MS` / `WEBHOOK_DELIVERY_INTERVAL_MS`) remains the correctness/fallback** (a missed or extra nudge only costs, at worst, one empty iteration). In-process only; a multi-replica deployment would use LISTEN/NOTIFY as the same kind of optimization, never as correctness.
+## Start worker
 
-## Start Loop (`start_loop` / `start_loop_leased`, `src/workers/start_loop.rs`)
+The scheduler first acquires leadership through a PostgreSQL advisory lock held on a dedicated, non-pooled connection. Only the leader schedules tasks; standby replicas retry on subsequent iterations.
 
-0. **Leader lease (Audit 2, D7)**: production uses `start_loop_leased` — each iteration is gated by a session `pg_try_advisory_lock` (`START_LEADER_LOCK_KEY`) held on a **dedicated non-pooled connection** (`establish_direct_connection`), so in a multi-replica deployment exactly one replica schedules at a time; a standby just re-contends each tick and takes over automatically when the leader's connection drops. Single-replica is unchanged (the sole loop always wins). `start_loop` (no lease, always leader) remains the test entry point. Gauge: `start_loop_is_leader`.
-1. Finds `Pending` tasks (ordered by priority DESC, then created_at ASC) via paginated keyset scan
-2. Checks concurrency rules — **DB-enforced via `rule_slot` counters** (see "Concurrency & Capacity rules" below)
-3. Claims eligible tasks atomically (Pending → Claimed → Running). **While a Claimed task waits for the concurrency semaphore permit (B2)**, `acquire_permit_with_heartbeat` bumps its `last_updated` every `claim_timeout / 3` via `tokio::select!`, preventing `requeue_stale_claimed_tasks` from reclaiming it.
-4. Executes on_start webhooks **synchronously** (control-flow — its response can register a cancel action; its failure marks the task Failed). **The DB connection is NOT held during the HTTP call (B1):** `execute_webhook_for_task` is split into phases like the delivery loop — phase A borrows a connection to claim the `start` outbox slot + A4 re-check + load the Start actions then **drops it**, phase B runs the on_start HTTP with **no connection held**, phase C re-acquires a connection for the A2/A4 running-transition transaction. This stops a burst of slow on_start webhooks from starving the pool (handlers + the other loops). A failed phase-C re-acquire leaves the task `Claimed` with a `pending` start row — recovered by requeue-stale + the A2 freshness bound, exactly as a process crash would be.
-5. On webhook failure: marks task as Failed, propagates to children, enqueues on_failure outbox rows (in-tx)
+Pending tasks are scanned in descending priority, then ascending creation time and UUID. The scan continues past blocked tasks so they cannot hide eligible work later in the backlog. `WORKER_START_BATCH_SIZE` limits successful claims per iteration, not the number of visible candidates.
 
-## Concurrency & Capacity rules — DB-enforced via `rule_slot` (Audit 2, D1 — 7.3a/7.3b)
+For each eligible task, the scheduler:
 
-Each rule of the candidate maps to a canonical textual key (`rule::concurrency_slot_key` → `conc:…`, `rule::capacity_slot_key` → `cap:…`); the claim transaction increments each slot with a conditional upsert (`ON CONFLICT DO UPDATE SET used = used + $inc WHERE used < $threshold RETURNING used`, keys processed sorted + deduped across both prefixes — A9 discipline) and a blocked slot rolls the whole claim back (`RuleBlocked`).
+1. Reserves all required rule slots and changes Pending to Claimed atomically.
+2. Waits for a webhook-concurrency permit, refreshing the claim timestamp while waiting.
+3. Creates or claims the start-execution record and rechecks that the task is still Claimed.
+4. Calls `on_start` without holding a pool connection.
+5. Records the result. A successful start persists any valid cancel action and changes the task to Running if it is still Claimed. A failed start fails the task and propagates the result.
 
-- **Concurrency** increments by `1` against `max_concurency`.
-- **Capacity** increments by the candidate's **charge** = `GREATEST(expected_count - success - failures, 0)` against `max_capacity` (the admission check is on *others'* current sum — the candidate's own charge is not counted, so overshoot is allowed, matching the old probe; a missing `expected_count` or a `max_capacity <= 0` ⇒ `RuleBlocked` Rust-side — the fresh-INSERT upsert arm has no `used < threshold` check, so the `<= 0` guard preserves the old always-block behavior).
+The Claimed state includes the HTTP call. A receiver may report completion during this state; the later start-result transaction does not overwrite that terminal state.
 
-O(1) per claim (no COUNT/SUM over `task`), replica-safe by row locking; the concurrency AND capacity advisory-lock + CTE-SUM layers are gone. **Semantic change (D1, assumed)**: a slot counts only tasks that claimed *through* the rule — a Running task that merely matches the matcher but carries no rule no longer blocks candidates (holds for both rule kinds).
+### Concurrency and capacity reservations
 
-The consumed keys are persisted in `task.claimed_slot_keys` and the charge in `task.capacity_charge` by the claim UPDATE (charge set NULL when no Capacity rule — paranoia against staleness), and **released** (decrement — by 1 per `conc:` key, by the *stored* `capacity_charge` per `cap:` key — + keys and charge NULLed, `release_slots_for_tasks`) in the same transaction as EVERY exit from Claimed/Running: success/failure PATCH, on_start failure, timeout, cancel of a Claimed/Running task, stop_batch, dead-end-canceled ancestors, and requeue-stale (Claimed → Pending). Keys and charge are never recomputed at release (metadata/expected_count are mutable while Running).
+Rules map to canonical keys based on rule type, matcher, and metadata values. Admission locks those keys in a stable order and reserves all slots in one transaction. If any rule blocks, the whole claim rolls back.
 
-**Capacity deltas are pushed by the batch_updater flush** (`handle_batch_with_counts`): in the same flush transaction (cap-slot pre-lock sorted FIRST, then the ordered task pre-lock — A9 slot-before-task discipline; the no-capacity common case costs one empty SELECT), each flushed task's `capacity_charge` shrinks to `GREATEST(LEAST(old, expected - success - failures), 0)` (monotonically non-increasing — a raised expected_count never raises the charge) and the shrink is decremented from its `cap:` slots, freeing capacity as Running tasks report progress via PUT. Divergence (accepted, user decision): a direct PATCH (counter-only `update_running_task`, or metadata/expected_count) does NOT push capacity deltas — only the flush does; the slot may read higher than true remaining (conservative — blocks more, never leaks) and is fully reconciled at release since release uses the stored charge.
+Concurrency rules reserve one unit. Capacity rules reserve the task's remaining work, `max(expected_count - success - failures, 0)`. Admission checks the existing capacity charge before adding the candidate, so a newly admitted task can take the total above the threshold.
 
-Empty (`used = 0`) slot rows are GC'd by the retention loop (which now always runs — the task retention stays gated by `RETENTION_ENABLED`, the slot GC does not).
+Only tasks admitted through a rule key occupy that key's reservations. Matching tasks without the rule do not count. The consumed keys and capacity charge are stored on each task and released when it leaves Claimed/Running, including requeue after a stale claim.
 
-## Retention Loop (`retention_cleanup_loop`, `src/workers/retention.rs`)
+Counter flushes reduce capacity reservations as work completes. Direct PATCH updates do not adjust capacity reservations mid-run. A capacity charge only decreases until it is released, even if `expected_count` is later increased.
 
-The loop ALWAYS runs (its `rule_slot` GC must happen even when task retention is off). When `RETENTION_ENABLED=1`, each pass:
+## Timeout worker
 
-1. **Moves** terminal tasks (Success/Failure/Canceled) with `ended_at` older than `RETENTION_DAYS` into the cold `task_archive` table (Audit 2, D6 / 7.5b) — `cleanup_old_terminal_tasks`. This is an atomic `WITH moved AS (DELETE FROM task ... RETURNING <cols>) INSERT INTO task_archive (<cols>, archived_at) SELECT <cols>, now() FROM moved` (explicit column lists both sides), in the SAME transaction as the deletion of the tasks' actions → webhook rows → links (FK order). The task record survives (still served by `GET /task/{id}`); its tooling does not. The orphan-`batch` sweep is unchanged — a batch whose tasks are all archived has no `task` rows left, so it is swept (its `batch_id` lives on in `task_archive` without an FK), unless a `batch_complete` signal is still queued.
-2. **Purges** the archive when `RETENTION_ARCHIVE_DAYS > 0` — `purge_old_archived_tasks` bounded-DELETEs `task_archive` rows with `archived_at` older than that window (`0` = keep forever, the default). This is the only thing that bounds archive growth.
+Each iteration first requeues stale Claimed tasks whose activity timestamp is older than `WORKER_CLAIM_TIMEOUT_SECS`. Requeue releases their reservations and makes them Pending again.
 
-Both steps are batched by `RETENTION_BATCH_SIZE` and gated by `RETENTION_ENABLED`; the `rule_slot` GC runs regardless.
+The worker then finds Running tasks whose `last_updated` exceeds their task-specific timeout. Each timeout commits Failure with reason `Timeout`, dependency propagation, reservation release, and failure-notification enqueue.
 
-## Timeout Loop (`timeout_loop`, `src/workers/timeout_loop.rs`)
+Timed-out tasks are processed oldest first, in passes of at most `WORKER_TIMEOUT_BATCH_SIZE`. An iteration drains at most 50 full passes before yielding. This bounds the work between stale-claim checks.
 
-0. **Requeues stale `Claimed` tasks first**, once per iteration, before the timeout drain — so a mass-timeout can never starve the requeue.
-1. Finds up to `WORKER_TIMEOUT_BATCH_SIZE` (default 100) `Running` tasks where `last_updated < now - timeout` (in seconds), oldest-first (**bounded per pass**, Audit 2, B7)
-2. Marks them as `Failure` with reason "Timeout" (one tx per task)
-3. Propagates failure to dependent children
-4. Enqueues on_failure outbox rows (in the same transaction)
-5. **Bounded drain**: if a pass returned a full batch there may be more, so it re-fetches immediately (no tick wait) until a short pass or a safety cap of `MAX_TIMEOUT_DRAIN_PASSES` (50) is hit — a mass-timeout of thousands of tasks no longer pins the loop for minutes and delays the stale-Claimed requeue.
+Timeout measures inactivity. Persisted counter updates and PATCH updates refresh `last_updated`; an update merely accepted into the in-memory PUT queue has not yet refreshed it.
 
-**Important**: The timeout is based on `last_updated`, NOT `started_at`. This means batch counter updates (via `PUT /task/{id}`) reset the timeout clock, preventing active tasks from being incorrectly timed out.
+## Counter updater
 
-## Delivery Loop
+`PUT /task/{id}` sends increments into a bounded channel. A receiver aggregates them by task in a `DashMap` with per-shard locking and atomic counters. The updater periodically snapshots accumulated increments and writes them to PostgreSQL.
 
-The webhook outbox drainer — see [webhooks.md](webhooks.md#delivery-loop).
+A flush updates counters and `last_updated`, and reduces any capacity reservations in the same transaction. Persisted counter sums are computed with wider arithmetic and clamped to `i32::MAX`.
 
-## Batch Updater (`src/workers.rs` / `src/workers/batch_updater.rs`)
+Failure handling distinguishes several cases:
 
-The batch updater efficiently handles high-throughput success/failure counter updates:
+- Updates targeting tasks that are now terminal, absent, or archived do not change them.
+- A failed batch write falls back to per-task writes. Every per-task database error is logged and its increments are queued again, independently of other rows succeeding. A task that no longer matches because it became terminal or disappeared is consumed without retry.
 
-```
-+----------------+     channel      +-------------------------------------+
-|   Handlers     | ---------------> |          Receiver Task               |
-| (HTTP reqs)    |   UpdateEvent    |  - Accumulates counts in DashMap     |
-+----------------+                  |  - No blocking, per-shard locks      |
-                                    +-------------------------------------+
-                                                   |
-                                                   | DashMap (concurrent)
-                                                   v
-                                    +-------------------------------------+
-                                    |         Updater Loop                 |
-                                    |  - Swaps counts atomically           |
-                                    |  - Persists to DB                    |
-                                    |  - Re-queues on failure              |
-                                    +-------------------------------------+
-```
+A `202` response acknowledges in-memory acceptance. Abrupt process termination can lose unflushed increments. During graceful shutdown the receiver drains buffered events before the final flush is attempted; persistence still depends on a successful database write.
 
-Key design decisions:
-- **DashMap**: Lock-free concurrent HashMap with per-shard locking
-- **Atomic counters**: `AtomicI32` for success/failures within each entry
-- **No data loss (transient only)**: only *transient* DB failures re-add counts for retry. Two classes of failure are **dropped instead of re-queued** (contract change, audit A7): (a) a flush landing on a task that has become **terminal** — the flush SQL is gated by `AND task.status NOT IN ('success','failure','canceled')`, so a terminal task's counters stay frozen (a terminal task's counters were already delivered with its end notification; re-applying would diverge forever, and a re-queue would loop forever); (b) a **poison row** — on a batch-flush error the updater falls back to per-row; if some rows succeed while others keep failing, the connection is demonstrably alive, so the failing rows are deterministically faulty and are dropped + logged (`record_batch_update_failure`) rather than wedging the whole pipeline. Only an *all-rows-fail* per-row pass (DB/connection down) re-queues.
-- **Overflow-safe**: the flush computes `LEAST(task.<c>::bigint + delta, 2147483647)` — the sum is done in `bigint` (no `int4` overflow) and clamped to `i32::MAX`, so a long-lived high-throughput counter can never poison the flush with `integer out of range`.
-- **Capacity-slot deltas (D1 / 7.3b)**: the flush transaction also shrinks each flushed capacity-holding task's `capacity_charge` to its new remaining work and decrements the shrink from its `cap:` `rule_slot` rows (A9: cap-slot pre-lock sorted FIRST, before the task pre-lock). This is the ONLY mid-run path that frees capacity; the common no-capacity flush pays one empty SELECT. `run_counter_flush_once` drives one flush deterministically for tests.
-- **Shutdown drain**: on shutdown the receiver task drains all still-buffered channel events (`try_recv`) and is joined **before** the final flush snapshots the map, so in-flight events are never lost at shutdown.
-- **Cleanup**: Zero-count entries removed periodically
+## Delivery loop
+
+The delivery worker claims due outbox rows, loads the necessary actions, sends HTTP requests, and records their outcomes. Requests for different events run concurrently; actions belonging to one event run sequentially.
+
+The lease, retries, ordering, and receiver contract are documented in [Webhooks](webhooks.md#delivery-loop). `run_delivery_once` exposes one iteration for integration tests.
+
+## Retention worker
+
+The retention worker always removes unused rule-slot rows. Task archiving and archive purging run only when `RETENTION_ENABLED=1`.
+
+A task is eligible for archiving when it is terminal and its `ended_at` is older than `RETENTION_DAYS`. It is retained while its own notification is queued, its batch-complete notification is queued, or its batch has completion actions and is still incomplete.
+
+Eligible tasks move to `task_archive` in a transaction that also removes their actions, dependency links, and webhook records. Empty batch records are cleaned up once no pending batch notification requires them.
+
+When `RETENTION_ARCHIVE_DAYS` is positive, archive records older than that many days since `archived_at` are deleted. Zero keeps them indefinitely. Both moves and purges are bounded by `RETENTION_BATCH_SIZE`.
+
+## Metrics sampler
+
+The sampler reads task counts by status, Running tasks by kind, and pool occupancy every `METRICS_SAMPLER_INTERVAL_SECS`. Failures are logged and the next iteration retries.
+
+The delivery loop samples outbox backlog separately, at most once every 15 seconds. Worker heartbeat and duration metrics are listed in [Metrics](metrics.md).
+
+## Wakeups and shutdown
+
+Handlers and workers notify the start or delivery loop after commits that make work available. These wakeups are local to a process. Polling provides the fallback for other replicas, retry deadlines, and lost wakeups.
+
+Workers observe the shutdown signal at their loop boundaries. A process that exits during notification delivery leaves durable outbox rows available for retry after their leases expire.

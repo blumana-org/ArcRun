@@ -11,10 +11,8 @@
 //! delivery LOG/history. The two tables are kept disjoint per idempotency_key by the
 //! backstop `NOT EXISTS (ledger)` on enqueue and the DELETE-then-INSERT on terminal.
 
-use crate::Conn;
-use crate::models::{
-    TriggerCondition, TriggerKind, WebhookExecution, WebhookExecutionStatus, WebhookOutbox,
-};
+use crate::models::{WebhookExecution, WebhookExecutionStatus, WebhookOutbox};
+use crate::{Conn, notification::TaskNotification};
 use diesel_async::RunQueryDsl;
 
 use super::DbError;
@@ -36,11 +34,10 @@ use super::DbError;
 pub async fn enqueue_outbox<'a>(
     conn: &mut Conn<'a>,
     task_id: uuid::Uuid,
-    trigger_kind: TriggerKind,
-    trigger_condition: TriggerCondition,
-    key: &str,
+    event: TaskNotification,
 ) -> Result<(), DbError> {
     use crate::schema::sql_types as st;
+    let key = event.idempotency_key(task_id);
 
     diesel::sql_query(
         "INSERT INTO webhook_outbox
@@ -52,8 +49,8 @@ pub async fn enqueue_outbox<'a>(
          ON CONFLICT (idempotency_key) DO NOTHING",
     )
     .bind::<diesel::sql_types::Uuid, _>(task_id)
-    .bind::<st::TriggerKind, _>(trigger_kind)
-    .bind::<st::TriggerCondition, _>(trigger_condition)
+    .bind::<st::TriggerKind, _>(event.trigger())
+    .bind::<st::TriggerCondition, _>(event.condition())
     .bind::<diesel::sql_types::Text, _>(key)
     .execute(conn)
     .await?;
@@ -72,8 +69,8 @@ pub async fn enqueue_outbox<'a>(
 pub async fn enqueue_batch_complete_outbox<'a>(
     conn: &mut Conn<'a>,
     batch_id: uuid::Uuid,
-    key: &str,
 ) -> Result<(), DbError> {
+    let key = crate::action::batch_complete_idempotency_key(batch_id);
     let rows_inserted = diesel::sql_query(
         "INSERT INTO webhook_outbox
             (batch_id, trigger, condition, idempotency_key, attempts, next_attempt_at)

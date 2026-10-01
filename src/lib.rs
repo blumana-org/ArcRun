@@ -9,6 +9,7 @@ pub mod error;
 pub mod handlers;
 pub mod metrics;
 pub mod models;
+pub mod notification;
 pub mod rule;
 pub(crate) mod schema;
 pub mod tracing;

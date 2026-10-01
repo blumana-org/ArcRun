@@ -39,11 +39,11 @@ pub async fn list_task(
     patch,
     path = "/task/{task_id}",
     summary = "Update task status (synchronous)",
-    description = "Update a running task's status to `Success` or `Failure`. This is the primary way external systems report task completion after receiving the `on_start` webhook.
+    description = "Update a Running or Claimed task's status to `Success` or `Failure`. This is the primary way external systems report task completion after receiving the `on_start` webhook.
 
 **Only `Success` and `Failure` are valid target statuses.** Setting `Failure` requires a `failure_reason`.
 
-This endpoint is synchronous: it immediately triggers `on_success`/`on_failure` webhooks and propagates status to dependent children. For high-throughput counter updates, use `PUT /task/{task_id}` instead.
+This endpoint commits the status change, dependency propagation, and end-notification enqueue in one transaction. The delivery loop sends `on_success`/`on_failure` webhooks asynchronously. For high-throughput counter updates, use `PUT /task/{task_id}` instead.
 
 **Idempotent & retry-safe:** re-sending the same terminal status a task already holds returns `200` as a no-op (no duplicate webhooks or propagation), so a client whose response was lost can safely retry. A request for a *different* status on an already-terminal task returns `409` with the current status in the body; an unknown id returns `404`.
 
@@ -56,7 +56,7 @@ The `task_id` is the UUID returned by `POST /task`, also available from the `?ha
         (status = 200, description = "Task updated, OR an idempotent no-op because the task already holds the requested status. Webhooks/propagation run only on a real transition."),
         (status = 400, description = "Validation failed (invalid status transition, missing failure_reason, etc.)"),
         (status = 404, description = "Task not found"),
-        (status = 409, description = "Task exists but is not Running (and not already the requested status); body includes `current_status`"),
+        (status = 409, description = "Task exists but is neither Running nor Claimed (and not already the requested status); body includes `current_status`"),
     ),
     tag = "tasks"
 )]
@@ -149,7 +149,7 @@ pub async fn get_task(
 
 Use this when your task processes many items and you want to report progress incrementally (e.g., 'processed 10 more items successfully'). At least one of `new_success` or `new_failures` must be non-zero. The `status` field is ignored by this endpoint.
 
-Returns 202 Accepted immediately — the actual database update happens in the background.",
+Returns 202 Accepted after queueing in memory, without checking task existence. Persistence happens in the background; an abrupt crash can lose unflushed updates. Only counter fields are applied.",
     params(("task_id" = Uuid, Path, description = "The UUID of the task to update counters for")),
     request_body(content = dtos::UpdateTaskDto, description = "Only `new_success` and `new_failures` are used. At least one must be non-zero."),
     responses(
@@ -213,7 +213,7 @@ pub async fn batch_task_updater(
 **Validation:** The entire batch is validated before any inserts. Circular dependencies, invalid webhook URLs, empty names/kinds, and SSRF attempts are rejected with 400.
 
 **Transaction:** All tasks are created in a single database transaction — either all succeed or none are created.",
-    request_body(content = dtos::CreateTaskBody, description = "Either a bare array of tasks `[NewTaskDto, …]` (legacy, fully supported), or an object `{ \"tasks\": [NewTaskDto, …], \"on_batch_complete\": [NewActionDto, …] }`. Order matters: a task can only depend on tasks defined earlier in the array. `on_batch_complete` registers a batch-level webhook fired once (at-least-once) when the LAST task of the batch reaches a terminal state."),
+    request_body(content = dtos::CreateTaskBody, description = "Either a bare array of tasks `[NewTaskDto, …]`, or an object `{ \"tasks\": [NewTaskDto, …], \"on_batch_complete\": [NewActionDto, …] }`. Order matters: a task can only depend on tasks defined earlier in the array. `scope` and `metadata` can attach batch identity. `on_batch_complete` enqueues one event when all inserted tasks are terminal; HTTP delivery may repeat."),
     responses(
         (status = 201, description = "Tasks created successfully. Response body is the array of created tasks with their server-assigned UUIDs. The `X-Batch-ID` header contains the batch UUID.", body = Vec<dtos::BasicTaskDto>),
         (status = 204, description = "All tasks were deduplicated — nothing was created. The `X-Batch-ID` header is still returned."),
@@ -380,7 +380,7 @@ pub async fn add_task(
     summary = "Cancel a task",
     description = "Cancel a task and propagate cancellation to its dependents. The task is set to `Canceled` status, which behaves like `Failure` for dependency propagation — children with `requires_success=true` will also be marked as `Failure` recursively.
 
-If the task has a registered `Cancel` action (returned by the `on_start` webhook response), that webhook is called.
+For Claimed/Running tasks, cancel notifications are queued transactionally. Registered `Cancel` actions (returned by the `on_start` webhook response) are delivered asynchronously.
 
 Only tasks in `Pending`, `Waiting`, `Paused`, `Claimed`, or `Running` status can be canceled. Terminal tasks (`Success`/`Failure`/`Canceled`) cannot.",
     params(("task_id" = Uuid, Path, description = "The UUID of the task to cancel")),

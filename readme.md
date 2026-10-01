@@ -4,249 +4,102 @@
 
 <h1 align="center">ArcRun</h1>
 
-<p align="center">A Rust service for orchestrating task execution with DAG (Directed Acyclic Graph) dependencies, concurrency control, and webhook-based actions.</p>
+<p align="center">A Rust service for orchestrating tasks through HTTP webhooks, with DAG dependencies and shared concurrency controls.</p>
 
-## Features
+ArcRun decides when work can start; your services execute it and report the result. PostgreSQL stores tasks, dependency state, scheduling reservations, and pending lifecycle notifications.
 
-- **DAG Dependencies**: Tasks can depend on other tasks, with support for `requires_success` flag
-- **Cascading Propagation**: Failures and cancellations automatically propagate through the dependency chain
-- **Concurrency Control**: Limit concurrent task execution per task kind using rules
-- **Webhook Actions**: Execute webhooks on task start, success, failure, or cancellation
-- **At-least-once Webhook Delivery**: End/cancel webhooks use a transactional outbox — committed in the status-change transaction (so the API response reflects durable state), delivered asynchronously with retries and exponential backoff, surviving crashes. `on_start` stays synchronous (control-flow). Inspect deliveries via `GET /webhook-deliveries?status=exhausted`
-- **Batch-Complete Webhook**: Register `on_batch_complete` on `POST /task` to fire a batch-level webhook exactly once (at-least-once via the same outbox) when the *last* task of a batch reaches a terminal state. The payload carries an `arcrun` object with `batch_id`, per-status `counts`, and `completed_at`. Works across success/failure/cancel/timeout/`stop_batch`; a fully dedupe-skipped batch fires immediately.
-- **Task States**: Waiting, Pending, Claimed, Running, Success, Failure, Canceled, Paused
-- **DAG Visualization**: Built-in web UI for visualizing task DAGs with auto-layout
-- **Batch Operations**: Batch stats, stop, and live rule updates
-- **Batch Counter Updates**: Efficient high-throughput endpoint for success/failure counters
-- **Capacity Rules**: Limit total remaining work across matching running tasks
-- **Idempotent Webhooks**: Automatic deduplication of webhook executions
-- **Data Retention**: Automatic cleanup of old terminal tasks
-- **Prometheus Metrics**: Built-in observability with custom metrics
-- **Deduplication**: Skip duplicate tasks based on metadata fields
-- **Input Validation**: Comprehensive validation with detailed error messages
-- **Circuit Breaker**: Connection pool resilience with automatic recovery
-- **Distributed Tracing**: OpenTelemetry support with OTLP export
-- **SSRF Protection**: Webhook URL validation to prevent server-side request forgery
-- **Health Checks**: Liveness and readiness probes for Kubernetes deployments
-- **Task Priority Scheduling**: Integer priority (-1000 to 1000) controls processing order within pending tasks
+## Capabilities
 
-## Quick Start
+- Task dependencies with success requirements and failure propagation.
+- Shared concurrency limits, capacity admission rules, and priority scheduling.
+- Batch discovery, progress statistics, cancellation, and completion notifications.
+- Durable end/cancel notifications with retries and event idempotency keys.
+- Task metadata matching and creation-time deduplication.
+- Optional bearer authentication and webhook SSRF protection.
+- Prometheus metrics, OpenTelemetry tracing, health probes, and a DAG viewer.
+- Optional task archiving with lookup by ID and configurable archive deletion.
 
-### With Docker
+## Get started
+
+The [local walkthrough](docs/getting-started.md) runs PostgreSQL, ArcRun, and the example worker, then submits a task through to completion.
+
+To run the server against an existing database:
 
 ```bash
-docker pull plawn/arcrun:latest
-
-docker run -e DATABASE_URL=postgres://user:pass@host/db \
-           -e HOST_URL=http://localhost:8085 \
-           -p 8085:8085 \
-           plawn/arcrun:latest
-```
-
-### From Source
-
-```bash
-# Run migrations
-diesel migration run
-
-# Start server
+DATABASE_URL=postgres://user:password@localhost/arcrun \
+HOST_URL=http://localhost:8085 \
 cargo run --bin server
 ```
 
-## Task Lifecycle
+ArcRun applies pending migrations automatically. `HOST_URL` must be reachable by webhook receivers because it forms their completion callback URL.
 
-```
-         +-----------------------------------------------------+
-         |                                                     |
-         v                                                     |
-     +-------+   +---------+   +---------+   +---------+      |
----->|Pending|-->| Claimed |-->| Running |-->| Success |      |
-     +-------+   +---------+   +---------+   +---------+      |
-         |             |             |                         |
-         |             |             |         +---------+     |
-         |             |             +-------->| Failure |     |
-         |             |                       +---------+     |
-         |             |                                     |
-         | (has deps)  | (start timeout -> requeue)          |
-         v             |                                     |
-     +-------+         |                                     |
-     |Waiting|---------+-------------------------------------+
-     +-------+  (all dependencies complete)
+A Docker image is also available:
 
-     +----------+     +----------+
-     | Canceled |     |  Paused  |
-     +----------+     +----------+
+```bash
+docker run --rm \
+  -e DATABASE_URL=postgres://user:password@db-host/arcrun \
+  -e HOST_URL=https://arcrun.example.com \
+  -e AUTH_TOKEN=replace-with-your-token \
+  -p 8085:8085 \
+  plawn/arcrun:latest
 ```
+
+Replace the database address, public callback address, and token with your deployment values. See [Configuration](docs/configuration.md) for internal receivers, authentication, and worker settings.
+
+## Execution model
+
+1. Submit tasks with `POST /task`, declaring dependencies through local IDs.
+2. ArcRun claims eligible tasks and calls their `on_start` webhook.
+3. The receiver accepts the work and reports Success or Failure to the URL in `handle`.
+4. ArcRun commits the result and propagates it through the graph. End/cancel and batch-complete notifications are delivered asynchronously.
+
+Notification delivery can repeat. Receivers should deduplicate events using their idempotency keys. Notification retries do not retry failed tasks.
+
+Progress increments sent through PUT are buffered in memory before persistence. Use PATCH when progress must commit with a final task result. See the [API contract](docs/api.md).
 
 ## Documentation
 
-- [API Reference](docs/api.md) - All endpoints, request/response formats, webhook execution
-- [Configuration](docs/configuration.md) - Environment variables for all subsystems
-- [Concepts](docs/concepts.md) - Dependencies, propagation, concurrency rules, capacity rules, deduplication
-- [Metrics](docs/metrics.md) - Full Prometheus metrics catalog
+| Guide | Covers |
+|-------|--------|
+| [Getting started](docs/getting-started.md) | Local end-to-end walkthrough and Docker deployment |
+| [Core concepts](docs/concepts.md) | Lifecycle, dependencies, rules, progress, and deduplication |
+| [API reference](docs/api.md) | Endpoints, fields, filters, and response behavior |
+| [Webhooks](docs/webhooks.md) | Receiver implementation, payloads, cancellation, retries, and ordering |
+| [Configuration](docs/configuration.md) | Environment variables and operational settings |
+| [Metrics](docs/metrics.md) | Prometheus catalog and monitoring signals |
+| [Architecture](docs/architecture.md) | Transactions, persistence, replicas, and code map |
+| [Workers](docs/workers.md) | Scheduling and background processing |
+| [Integration tests](tests/README.md) | Test commands, isolation, and helpers |
 
-## Architecture
-
-- **Actix-web**: HTTP server with async handlers
-- **Diesel + diesel-async**: Async PostgreSQL ORM with bb8 connection pooling
-- **Start Loop**: Background loop that:
-  - Checks pending tasks against concurrency rules
-  - Claims and starts eligible tasks (executes on_start webhooks)
-  - Propagates completions to dependent children
-- **Timeout Loop**: Background loop that:
-  - Finds running tasks where `last_updated` exceeds the timeout duration
-  - Marks them as failed, propagates to children, enqueues on_failure outbox rows
-- **Delivery Loop**: Background loop that drains the webhook outbox:
-  - Selects mature `pending` end/cancel rows (`FOR UPDATE SKIP LOCKED`), gated so `start` is delivered before `end` per task
-  - Delivers via the shared HTTP client; marks `success`, or retries with exponential backoff, or `exhausted` after the max attempts
-- **Batch Updater**: High-throughput counter updates using:
-  - `DashMap` for lock-free concurrent access (per-shard locking)
-  - Atomic counters (`AtomicI32`) for success/failure counts
-  - Automatic retry on DB failure (re-queues counts)
-  - Periodic cleanup of zero-count entries
-- **Retention Loop**: Automatic cleanup of old terminal tasks based on configurable retention period
-- **Circuit Breaker**: Connection pool resilience with states:
-  - Closed (normal) -> Open (rejecting) -> HalfOpen (testing recovery)
-- **OpenTelemetry**: Distributed tracing with OTLP export
-- **Prometheus**: Metrics exposition with custom registry
-- **Cytoscape.js + Dagre**: DAG visualization with auto-layout
-
-## Project Structure
-
-```
-src/
-+-- main.rs              # HTTP server, startup, worker spawning
-+-- test_server.rs       # Test server binary
-+-- cache_helper.rs      # Cache utility binary
-+-- lib.rs               # Module declarations, DB pool initialization
-+-- models.rs            # Database models (Task, Action, Link, enums)
-+-- schema.rs            # Diesel schema (auto-generated)
-+-- action.rs            # Webhook action execution
-+-- rule.rs              # Concurrency rules and matchers
-+-- config.rs            # Configuration loading from env vars
-+-- metrics.rs           # Prometheus metrics
-+-- error.rs             # Typed error definitions
-+-- circuit_breaker.rs   # Circuit breaker for DB pool resilience
-+-- tracing.rs           # OpenTelemetry distributed tracing
-+-- handlers/            # HTTP handlers and route configuration
-|   +-- mod.rs           # Route registration (configure_routes)
-|   +-- task.rs          # Task CRUD endpoints
-|   +-- batch.rs         # Batch stats, stop, rules endpoints
-|   +-- dag.rs           # DAG visualization endpoints
-|   +-- health.rs        # Health and readiness probes
-|   +-- response.rs      # Response helpers
-+-- dtos/                # API DTOs and query parameters
-|   +-- task.rs          # Task input/output DTOs
-|   +-- batch.rs         # Batch DTOs (stats, stop, rules)
-|   +-- dag.rs           # DAG DTOs
-|   +-- query.rs         # Pagination and filter DTOs
-+-- db/                  # Database operations
-|   +-- task_crud.rs     # Task insert, update, delete
-|   +-- task_lifecycle.rs # Status transitions, propagation triggers
-|   +-- task_query.rs    # Task queries (get, list, filter)
-|   +-- batch_listing.rs # Batch stats and listing
-|   +-- cleanup.rs       # Batch stop, retention cleanup
-|   +-- webhook_execution.rs # Webhook execution tracking
-+-- workers/             # Background worker loops
-|   +-- start_loop.rs    # Pending -> Running task processing
-|   +-- timeout_loop.rs  # Timeout detection
-|   +-- propagation.rs   # Dependency propagation
-|   +-- batch_updater.rs # High-throughput counter updates
-|   +-- webhooks.rs      # Webhook firing logic
-|   +-- retention.rs     # Automatic cleanup of old tasks
-+-- validation/          # Input validation
-|   +-- task.rs          # Task batch validation
-|   +-- action.rs        # Action/webhook validation
-|   +-- ssrf.rs          # SSRF protection
-|   +-- constants.rs     # Validation constants
-sdk/                     # Rust client SDK (workspace member)
-static/
-+-- dag.html             # DAG visualization UI
-test/
-+-- test.ts              # Manual testing script (Bun)
-migrations/              # Diesel migrations
-tests/
-+-- integration/         # Integration tests with testcontainers
-    +-- common/          # Shared test helpers and builders
-    +-- test_*.rs        # Test modules (CRUD, DAG, propagation, etc.)
-```
+The running server exposes Swagger at `/swagger-ui/`, its schema at `/api-docs/openapi.json`, and the graph viewer at `/view?batch=<batch-id>`. With `AUTH_TOKEN` set, every endpoint except `/health` and `/ready` requires the bearer header, including worker callbacks.
 
 ## Development
 
+The workspace contains the server and Rust client SDK in `sdk/`. Integration tests use one shared PostgreSQL container with isolated databases per test; Docker must be running.
+
 ```bash
-# Run migrations
-diesel migration run
-
-# Start server
-cargo run --bin server
-
-# Run tests (requires Docker for testcontainers)
-cargo test
-
-# Run integration tests only
+cargo test --workspace
 cargo test --test integration
-
-# Manual testing with bun
-cd test && bun test.ts dag
+cargo fmt --all -- --check
 ```
 
-### Test Commands
+Build the embedded DAG viewer before compiling the server with `(cd ui && bun install --frozen-lockfile && bun run build)`. Without this build, a fresh checkout serves a placeholder at `/view`.
+
+The manual example worker runs with `cargo run --bin test-server`. Additional Bun scripts live in `test/`.
+
+The documentation site reads `docs/` directly:
 
 ```bash
-# Create a CI/CD pipeline DAG
-bun test.ts dag
-
-# Create a single task
-bun test.ts single
-
-# List all tasks
-bun test.ts list
-
-# Update a task status
-bun test.ts update <task_id> Success
-bun test.ts update <task_id> Failure
-
-# View DAG data as JSON
-bun test.ts view <batch_id>
+cd website
+bun install --frozen-lockfile
+bun run typecheck
+bun run build
 ```
 
-## Releasing
+Public guides describe the current implementation. Planning notes, audits, and handoff documents under `docs/` are internal records and are excluded from the published site.
 
-Create a new release by pushing a Git tag:
+## Releases
 
-```bash
-# Create and push a version tag
-git tag v1.0.0
-git push origin v1.0.0
-```
+Pushing a version tag such as `v1.2.1` triggers CI builds for Linux amd64 and arm64. Images are published to `plawn/arcrun` with full version, major/minor, major (except v0), and commit-SHA tags. Main/master branch builds update `latest`.
 
-This triggers the CI pipeline which builds multi-arch Docker images (amd64 + arm64) and pushes them to DockerHub with the following tags:
-
-| Tag | Example | Description |
-|-----|---------|-------------|
-| `{version}` | `1.0.0` | Full semantic version |
-| `{major}.{minor}` | `1.0` | Major.minor version |
-| `{major}` | `1` | Major version (not created for v0.x) |
-| `sha-{commit}` | `sha-abc1234` | Git commit SHA |
-| `latest` | `latest` | Updated on main/master branch pushes |
-
-Pull the image:
-```bash
-docker pull plawn/arcrun:1.0.0
-# or
-docker pull plawn/arcrun:latest
-```
-
-## TODO
-
-- [x] DAG visualization UI
-- [x] Cascading failure propagation
-- [x] Cancel propagation to children
-- [x] Circuit breaker for connection pool
-- [x] Distributed tracing
-- [x] SSRF protection
-- [x] Health and readiness endpoints
-- [ ] Automatic rule reuse
-- [ ] Automatic action reuse
-- [ ] Failure count on actions for retries
-- [ ] Task retry with backoff
+Choose an unused version and keep the release tag consistent with the package version before pushing it.

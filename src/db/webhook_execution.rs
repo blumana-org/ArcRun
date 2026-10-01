@@ -154,8 +154,7 @@ pub async fn decrement_batch_remaining_for_tasks<'a>(
 
     for cb in updated {
         if cb.remaining == 0 && cb.has_webhook {
-            let key = crate::action::batch_complete_idempotency_key(cb.id);
-            super::webhook_outbox::enqueue_batch_complete_outbox(conn, cb.id, &key).await?;
+            super::webhook_outbox::enqueue_batch_complete_outbox(conn, cb.id).await?;
             log::debug!(
                 "[{}] batch {} reached remaining=0 — enqueued batch_complete outbox row",
                 caller,
@@ -203,8 +202,7 @@ pub async fn zero_batch_remaining_and_complete<'a>(
     if let Some(r) = row
         && r.has_webhook
     {
-        let key = crate::action::batch_complete_idempotency_key(batch_id);
-        super::webhook_outbox::enqueue_batch_complete_outbox(conn, batch_id, &key).await?;
+        super::webhook_outbox::enqueue_batch_complete_outbox(conn, batch_id).await?;
         log::debug!(
             "[{}] batch {} stopped (remaining set to 0) — enqueued batch_complete outbox row",
             caller,
@@ -246,8 +244,7 @@ pub async fn init_batch_remaining<'a>(
     if let Some(r) = row
         && r.fire
     {
-        let key = crate::action::batch_complete_idempotency_key(batch_id);
-        super::webhook_outbox::enqueue_batch_complete_outbox(conn, batch_id, &key).await?;
+        super::webhook_outbox::enqueue_batch_complete_outbox(conn, batch_id).await?;
         log::debug!(
             "[{}] batch {} vacuously complete (0 tasks inserted) — enqueued batch_complete outbox row",
             caller,

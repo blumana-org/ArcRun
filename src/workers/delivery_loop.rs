@@ -27,7 +27,7 @@
 //!    are stable. The fast-paths (task/batch gone ⇒ success; malformed batch payload ⇒
 //!    exhausted; zero actions ⇒ success) are resolved here, before any HTTP.
 //! 3. **Deliver (parallel, no DB).** The HTTP executions run concurrently, bounded by
-//!    `concurrency`, via `buffer_unordered`. No DB connection is held during HTTP.
+//!    `concurrency`, via `buffer_unordered`. No transaction or row lock is held during HTTP; the caller retains its pool connection.
 //!    Actions of a *single* row stay sequential (unchanged behaviour).
 //! 4. **Mark (short autocommit statements).** Each outcome is committed with the
 //!    existing `mark_outbox_*` helpers. A failed mark is logged and skipped — it does
@@ -46,7 +46,7 @@ use crate::{
     Conn, DbPool,
     action::{ActionExecutor, WebhookEnrichment},
     db_operation, metrics,
-    models::{Action, StatusKind, Task, TriggerCondition, TriggerKind, WebhookOutbox},
+    models::{Action, Task, TriggerCondition, TriggerKind, WebhookOutbox},
     workers::WorkerNudges,
 };
 
@@ -135,7 +135,7 @@ pub async fn delivery_loop(
 ///
 /// Four phases (see module docs): short claim tx (with lease), out-of-tx prefetch,
 /// parallel HTTP delivery, then short mark statements. The single `conn` is used only
-/// for the DB phases (claim / prefetch / marks); the HTTP phase holds no connection.
+/// for the DB phases (claim / prefetch / marks); the caller retains the connection during the HTTP phase, outside a transaction.
 pub async fn run_delivery_once<'a>(
     evaluator: &'a ActionExecutor,
     conn: &mut Conn<'a>,
@@ -167,7 +167,7 @@ pub async fn run_delivery_once<'a>(
         }
     }
 
-    // Phase 3 — deliver in parallel (no DB connection held).
+    // Phase 3 — deliver in parallel (no DB transaction or row lock held).
     let outcomes: Vec<DeliveryOutcome> = stream::iter(plans.into_iter().map(|plan| {
         let evaluator = &*evaluator;
         async move { deliver_plan(evaluator, plan, cfg).await }
@@ -739,14 +739,5 @@ fn trigger_label(trigger: TriggerKind, condition: TriggerCondition) -> &'static 
         (TriggerKind::Cancel, _) => "cancel",
         (TriggerKind::Start, _) => "start",
         (TriggerKind::BatchComplete, _) => "batch_complete",
-    }
-}
-
-/// Map a task's final status to the outbox `end` condition. Mirrors the inline
-/// `fire_end_webhooks` mapping (Success => Success, everything else => Failure).
-pub(crate) fn end_condition_for(status: StatusKind) -> TriggerCondition {
-    match status {
-        StatusKind::Success => TriggerCondition::Success,
-        _ => TriggerCondition::Failure,
     }
 }

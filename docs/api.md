@@ -1,304 +1,333 @@
 # API Reference
 
-## Health
+ArcRun accepts JSON request bodies and returns JSON for task and batch data. UUID path parameters identify server-created tasks and batches. The generated schema is available at `/api-docs/openapi.json`, with an interactive explorer at `/swagger-ui/`.
 
-### Health Check
+For a complete local example, see [Getting started](getting-started.md). Webhook receiver behavior is documented in [Webhooks](webhooks.md).
+
+## Authentication
+
+When `AUTH_TOKEN` is set, every request except `/health` and `/ready` requires:
+
 ```http
-GET /health
+Authorization: Bearer <token>
 ```
 
-Returns database connectivity status and connection pool stats.
+Missing or invalid credentials return `401`. Authentication also applies to completion callbacks, metrics, Swagger, and `/view`. The callback URL provided to a worker contains no token. An unset or blank `AUTH_TOKEN` disables authentication.
 
-Response `200 OK` (healthy) or `503 Service Unavailable` (degraded):
-```json
-{
-  "status": "ok",
-  "database": "healthy",
-  "pool_size": 10,
-  "pool_idle": 5
-}
-```
+The built-in browser pages do not supply this header themselves. With authentication enabled, serve them through a proxy that authenticates the user and injects the header on their requests.
 
-### Readiness Check
-```http
-GET /ready
-```
+## Endpoint summary
 
-Stricter check - verifies pool is not exhausted and a connection can be acquired.
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/health` | Liveness and pool status |
+| GET | `/ready` | Readiness |
+| POST | `/task` | Create a batch of tasks |
+| GET | `/task` | List and filter tasks |
+| GET | `/task/{task_id}` | Read a task, including archived records |
+| PATCH | `/task/{task_id}` | Update progress or report completion |
+| PUT | `/task/{task_id}` | Queue progress increments |
+| DELETE | `/task/{task_id}` | Cancel a task |
+| PATCH | `/task/pause/{task_id}` | Pause a Pending/Waiting task |
+| PATCH | `/task/resume/{task_id}` | Resume a Paused task |
+| GET | `/batches` | Discover batches |
+| GET | `/batch/{batch_id}` | Read aggregate progress |
+| DELETE | `/batch/{batch_id}` | Stop a batch |
+| PATCH | `/batch/{batch_id}/rules` | Change rules for tasks not yet active |
+| GET | `/dag/{batch_id}` | Read graph data |
+| GET | `/view?batch={batch_id}` | Open the graph viewer |
+| GET | `/webhook-deliveries` | Inspect pending deliveries and execution history |
+| GET | `/metrics` | Prometheus metrics |
 
-Response `200 OK` or `503 Service Unavailable`:
-```json
-{"status": "ready"}
-```
+## Pagination
 
-## Tasks
+Task, batch, and delivery listings return arrays and accept these parameters:
 
-### Create Tasks
+| Parameter | Default | Behavior |
+|-----------|---------|----------|
+| `page` | `0` | Zero-based page; negative values become zero |
+| `page_size` | `50` | Values above the configured maximum are clamped; non-positive values use the default |
+
+The default and maximum come from `PAGINATION_DEFAULT` and `PAGINATION_MAX`; the maximum defaults to 100.
+
+## Create tasks
+
 ```http
 POST /task
 Content-Type: application/json
+```
 
+The simplest body is an array:
+
+```json
 [
   {
-    "id": "local-id-1",
-    "name": "My Task",
-    "kind": "data-processing",
-    "timeout": 60,
-    "metadata": {"key": "value"},
+    "id": "import",
+    "name": "Import records",
+    "kind": "import",
+    "timeout": 300,
+    "metadata": {"tenant_id": "acme"},
+    "expected_count": 100,
     "on_start": {
       "kind": "Webhook",
       "params": {
-        "url": "https://example.com/webhook",
+        "url": "https://worker.example.com/import",
         "verb": "Post",
-        "body": {"optional": "payload"},
-        "headers": {"X-Custom": "header"}
+        "body": {"source": "daily"}
       }
-    },
-    "dependencies": [
-      {"id": "local-id-0", "requires_success": true}
-    ],
-    "on_success": [
-      {"kind": "Webhook", "params": {"url": "https://example.com/done", "verb": "Post"}}
-    ],
-    "on_failure": [
-      {"kind": "Webhook", "params": {"url": "https://example.com/failed", "verb": "Post"}}
-    ],
-    "priority": 500,
-    "rules": [
-      {
-        "type": "Concurency",
-        "matcher": {"kind": "data-processing", "status": "Running", "fields": []},
-        "max_concurency": 5
-      }
-    ],
-    "dedupe_strategy": [
-      {"kind": "data-processing", "status": "Pending", "fields": ["key"]}
-    ]
+    }
   }
 ]
 ```
 
-Fields:
-- `timeout` (seconds): Maximum inactivity time. The task is marked as `Failure` if `last_updated` exceeds this duration. Batch counter updates (`PUT /task/{id}`) refresh `last_updated`, resetting the timeout clock.
-- `priority` (integer, optional): Scheduling priority, range -1000 to 1000, default 0. Higher values are processed first when the worker picks up pending tasks.
+Example domains must be replaced with your receivers. The [local walkthrough](getting-started.md) uses the included worker instead.
 
-Response: `201 Created` with array of created tasks, includes `X-Batch-ID` header.
-If all tasks were deduplicated: `204 No Content` with `X-Batch-ID` header.
+### Task fields
 
-On validation failure: `400 Bad Request`:
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `id` | Yes | Non-empty local identifier, unique within this request |
+| `name` | Yes | Non-empty display name; maximum 255 bytes |
+| `kind` | Yes | Non-empty task category; maximum 100 bytes |
+| `on_start` | Yes | One webhook action |
+| `timeout` | No | Inactivity timeout while Running, 1–86400 seconds; default 60 |
+| `metadata` | No | JSON metadata, maximum 64 KiB; used by rule and deduplication matchers |
+| `dependencies` | No | Array of `{ "id": "earlier-local-id", "requires_success": true }` |
+| `on_success` | No | Array of webhook actions for Success |
+| `on_failure` | No | Array of webhook actions for Failure |
+| `expected_count` | No | Non-negative expected item count; required by Capacity rules |
+| `rules` | No | Array of Concurency or Capacity strategies |
+| `dedupe_strategy` | No | Array of matchers that can skip task creation |
+| `priority` | No | Integer from -1000 to 1000; default 0 |
+| `dead_end_barrier` | No | Stop upward dead-end cancellation after this task; default false |
+
+Dependencies must reference earlier tasks in the same request. Reaching `expected_count` does not change task status. See [Core concepts](concepts.md) for rules, dependency behavior, and deduplication.
+
+### Batch fields
+
+Use an object body to attach batch identity or completion actions:
+
 ```json
 {
-  "error": "Validation failed",
-  "batch_id": "uuid",
-  "details": ["error message 1", "error message 2"]
+  "scope": "daily-import",
+  "metadata": {"tenant_id": "acme"},
+  "tasks": [{
+    "id": "import",
+    "name": "Import records",
+    "kind": "import",
+    "on_start": {
+      "kind": "Webhook",
+      "params": {"url": "https://worker.example.com/import", "verb": "Post"}
+    }
+  }],
+  "on_batch_complete": [{
+    "kind": "Webhook",
+    "params": {"url": "https://worker.example.com/batch-done", "verb": "Post"}
+  }]
 }
 ```
 
-### Get Task
+`scope`, batch `metadata`, and `on_batch_complete` are optional. Scope must be non-empty and no more than 255 bytes. Batch metadata has a 64 KiB limit and is independent of task metadata.
+
+Completion actions are queued when every inserted task is terminal, or immediately if all tasks were skipped by deduplication. Delivery may repeat; see [batch completion](webhooks.md#batch-completion).
+
+### Responses
+
+| Status | Meaning |
+|--------|---------|
+| `201 Created` | Array of created tasks (`BasicTaskDto`), with `X-Batch-ID` |
+| `204 No Content` | All tasks were skipped by deduplication; still includes `X-Batch-ID` |
+| `400 Bad Request` | Invalid task, dependency, rule, action, or batch metadata |
+| `413 Payload Too Large` | Request body exceeds `PAYLOAD_MAX_BYTES` |
+
+Creation is atomic. Configurable task, dependency, and action limits are listed in [Configuration](configuration.md#request-limits). A task-validation error has this shape:
+
+```json
+{
+  "error": "Validation failed",
+  "batch_id": "019a0000-0000-7000-8000-000000000001",
+  "details": ["validation error description"]
+}
+```
+
+Malformed JSON and other validation paths may use a different error body; branch on the HTTP status before parsing details.
+
+## Read a task
+
 ```http
 GET /task/{task_id}
 ```
 
-Response: Full task details with all actions (fetched via single LEFT JOIN query).
+Returns `200` with `TaskDto`: identity, status, rules, metadata, registered actions, progress counters, timeout, priority, batch ID, and lifecycle timestamps. Unknown or purged IDs return `404`.
 
-If the task has been moved to the cold archive by retention (Audit 2, D6), this endpoint still serves it from `task_archive` with the **same response shape** — every field is present, except `actions` is an empty array (an archived task's actions are dropped on archive). Only `GET /task/{id}` reads the archive; listings, the DAG view, and writes (`PATCH`/`PUT`/`DELETE`) do not — a write to an archived task is a `404`.
+An archived task has the same response shape with `actions: []`. Only this endpoint reads the archive. Task listings, DAGs, batch statistics, and lifecycle writes use the main task table.
 
-```json
-{
-  "id": "uuid",
-  "name": "My Task",
-  "kind": "data-processing",
-  "status": "Running",
-  "timeout": 60,
-  "priority": 0,
-  "rules": [],
-  "metadata": {"key": "value"},
-  "actions": [
-    {"kind": "Webhook", "trigger": "Start", "params": {"url": "...", "verb": "Post"}}
-  ],
-  "created_at": "2024-01-01T00:00:00Z",
-  "started_at": "2024-01-01T00:00:01Z",
-  "ended_at": null,
-  "last_updated": "2024-01-01T00:00:01Z",
-  "success": 0,
-  "failures": 0,
-  "failure_reason": null,
-  "batch_id": "uuid"
-}
-```
+## List tasks
 
-### List Tasks
 ```http
-GET /task?page=0&page_size=50&status=Running&kind=data-processing&batch_id=uuid&name=my&metadata={"key":"value"}
+GET /task?page=0&page_size=50&status=Running&kind=import
 ```
 
-Query parameters:
-- `page`: Page number (default: 0)
-- `page_size`: Items per page (default: 50, max: 100)
-- `status`: Filter by status (optional)
-- `kind`: Filter by kind (substring match, optional)
-- `name`: Filter by name (substring match, optional)
-- `batch_id`: Filter by batch ID (optional)
-- `metadata`: Filter by metadata JSON containment (optional)
+Returns `200` with an array of lightweight `BasicTaskDto` objects, without actions, rules, or metadata.
 
-Response: `200 OK` with array of `BasicTaskDto`.
+| Filter | Matching |
+|--------|----------|
+| `name` | Substring |
+| `kind` | Substring |
+| `status` | Task state such as `Running` or `Success` |
+| `timeout` | Exact integer timeout |
+| `batch_id` | Exact batch UUID |
+| `metadata` | JSON containment |
 
-### Update Task
+Filters combine with AND. URL-encode JSON values. For example, with authentication enabled:
+
+```bash
+curl --get "$ARCRUN_URL/task" \
+  -H "Authorization: Bearer $ARCRUN_TOKEN" \
+  --data-urlencode 'metadata={"tenant_id":"acme"}'
+```
+
+Set `ARCRUN_URL` to the server base URL and `ARCRUN_TOKEN` to its bearer token. Invalid JSON in the metadata filter returns `400`.
+
+## Report completion or update a task
+
 ```http
 PATCH /task/{task_id}
 Content-Type: application/json
 
-{
-  "status": "Success",
-  "new_success": 10,
-  "new_failures": 2,
-  "metadata": {"updated": true},
-  "priority": 100,
-  "failure_reason": "Error message (required if status=Failure)"
-}
+{"status":"Success","new_success":10}
 ```
 
-Only `Success` or `Failure` status transitions are allowed. Setting status triggers end actions and dependency propagation. Failed tasks cannot be updated further. The `priority` field can be updated independently of status (range -1000 to 1000).
+To report failure:
 
-### Cancel Task
-```http
-DELETE /task/{task_id}
+```json
+{"status":"Failure","failure_reason":"Source service unavailable"}
 ```
 
-Cancels a pending or running task. For running tasks, executes cancel actions.
-**Cancellation propagates** to dependent children that require success.
+PATCH applies to Running or Claimed tasks. Supported fields are `status`, `new_success`, `new_failures`, `metadata`, `expected_count`, `priority`, and `failure_reason`. Counters are non-negative increments. `metadata` replaces the entire stored value. The target status can only be Success or Failure; Failure requires a reason.
 
-### Pause Task
-```http
-PATCH /task/pause/{task_id}
-```
+The response follows the commit of the update, dependency propagation, and notification enqueue. End webhooks are delivered asynchronously.
 
-Pauses a task (sets status to `Paused`).
+| Situation | Response |
+|-----------|----------|
+| Running/Claimed task updated | `200` |
+| Same terminal status requested again | `200`, no-op; additional fields are not reapplied |
+| Different terminal status, or another state cannot accept completion | `409`, with `current_status` |
+| Unknown or archived task | `404` |
+| Invalid values | `400` |
 
-### Batch Update (High-throughput)
+Without `status`, PATCH can synchronously update progress or metadata, but only for Running/Claimed tasks. If no row matches that condition, it returns `404` even if a task in another state exists. Priority updates have the same restriction.
+
+## Update progress counters
+
 ```http
 PUT /task/{task_id}
 Content-Type: application/json
 
-{
-  "new_success": 5,
-  "new_failures": 2
-}
+{"new_success":5,"new_failures":2}
 ```
 
-This endpoint efficiently batches counter updates using a lock-free `DashMap` architecture for high concurrency. At least one of `new_success` or `new_failures` must be non-zero. Returns `202 Accepted` when the update is queued.
+At least one counter must be positive; negative increments are rejected with `400`. Only counter fields are applied. Status, metadata, expected count, and priority are ignored.
 
-Each batch update refreshes the task's `last_updated` timestamp, which resets the timeout clock. This prevents active tasks (still receiving updates) from being incorrectly timed out.
+`202 Accepted` means the increments entered the in-memory queue. It does not verify task existence or confirm persistence. The updater flushes periodically; abrupt process termination can lose accepted increments. Terminal, absent, and archived tasks are not updated, including a task that becomes terminal between acceptance and flush.
 
-## Batches
+Persisted increments refresh the inactivity timestamp. Updates are not idempotent: resending an increment can count it again. Avoid relying on a PUT immediately before completion for an exact final count; include the final increment in the completion PATCH when it must commit with the result.
 
-### Get Batch Stats
+## Cancel, pause, and resume
+
+| Endpoint | Allowed source states | Result |
+|----------|-----------------------|--------|
+| `DELETE /task/{task_id}` | Waiting, Pending, Paused, Claimed, Running | Canceled |
+| `PATCH /task/pause/{task_id}` | Pending, Waiting | Paused |
+| `PATCH /task/resume/{task_id}` | Paused | Waiting if dependencies remain, otherwise Pending |
+
+These return `200` on success, `400` for an existing task in a disallowed state, and `404` for an unknown or archived task.
+
+Cancellation fails dependent children that require success. Cancel actions for Claimed/Running tasks are queued for asynchronous delivery. Paused tasks still receive dependency updates and can fail when a required parent fails.
+
+## List batches
+
+```http
+GET /batches?page=0&page_size=50
+```
+
+Returns `200` with batch summaries containing `batch_id`, `total_tasks`, creation/update timestamps, `status_counts`, distinct `kinds`, `scope`, `metadata`, and `remaining`.
+
+| Filter | Matching |
+|--------|----------|
+| `name`, `kind` | Task substring filters |
+| `status` | Task state |
+| `created_after`, `created_before` | Task creation timestamps, inclusive |
+| `scope` | Exact batch scope |
+| `metadata` | Batch metadata JSON containment |
+| `search` | Substring across batch scope and metadata text |
+
+Filters combine with AND. Task filters select batches containing a matching task. Counts and timestamps describe all current tasks in each selected batch; `kinds` is collected from the tasks matching the filters. URL-encode JSON and timestamp query values.
+
+`remaining` counts non-terminal tasks for batches with a persisted batch record. It is null when no completion actions, scope, or metadata were supplied at creation.
+
+## Read batch progress
+
 ```http
 GET /batch/{batch_id}
 ```
 
-Returns aggregated counters for a batch: total success, total failures, total expected count, and per-status task counts. Use this to track overall progress of a batch.
+Returns `200` with `batch_id`, `total_tasks`, `total_success`, `total_failures`, `total_expected`, `status_counts`, `scope`, and `metadata`. `total_expected` is null if any task lacks an expected count. Batches with no current tasks return `404`, including fully archived or fully deduplicated batches.
 
-Response `200 OK` or `404 Not Found`.
+The success/failure totals count processed items. The per-status counts count tasks.
 
-### Stop Batch
+## Stop a batch
+
 ```http
 DELETE /batch/{batch_id}
 ```
 
-Cancel all non-terminal tasks in a batch. Waiting, Pending, Paused, and Running tasks are set to `Canceled` with failure_reason `"Batch stopped"`. Running tasks with registered cancel webhooks will have those webhooks fired.
+Cancels every non-terminal task with reason `Batch stopped`. Already terminal tasks remain unchanged. Cancel notifications for formerly Claimed/Running tasks are queued transactionally.
 
-Tasks already in a terminal state (Success, Failure, Canceled) are not modified.
+Returns `200` with counts in `canceled_waiting`, `canceled_pending`, `canceled_claimed`, `canceled_running`, `canceled_paused`, and `already_terminal`, plus `batch_id`. Batches with no current tasks return `404`, including fully archived or fully deduplicated batches.
 
-Response `200 OK` with counts per status category, or `404 Not Found`.
+## Update batch rules
 
-### Update Batch Rules
 ```http
 PATCH /batch/{batch_id}/rules
 Content-Type: application/json
 
 {
-  "kind": "data-processing",
-  "rules": [
-    {
-      "type": "Concurency",
-      "matcher": {"kind": "data-processing", "status": "Running", "fields": []},
-      "max_concurency": 10
-    }
-  ]
+  "kind":"import",
+  "rules":[{
+    "type":"Concurency",
+    "matcher":{"kind":"import","status":"Running","fields":[]},
+    "max_concurency":10
+  }]
 }
 ```
 
-Update concurrency/capacity rules for all non-terminal tasks of a given kind in a batch. Pass an empty `rules` array to remove all rules.
+Replaces rules on Waiting, Pending, and Paused tasks of the specified kind. Claimed/Running tasks retain their rules and reservations. An empty rules array removes rules from eligible tasks.
 
-Response `200 OK` with the count of affected tasks.
+Returns `200` with `batch_id`, `kind`, and `updated_count`, including zero when no task of that kind is eligible. Invalid rules or an empty kind return `400`; a batch with no current tasks returns `404`.
 
-### List Batches
+## Graph data and viewer
+
+`GET /dag/{batch_id}` returns an object with `tasks` (`BasicTaskDto[]`) and `links`. Each link contains `parent_id`, `child_id`, and `requires_success`.
+
+`GET /view?batch={batch_id}` opens the built-in graph viewer with automatic layout, status colors, task details, and optional periodic refresh. The viewer reads current task data, excluding archived tasks.
+
+## Inspect webhook deliveries
+
 ```http
-GET /batches?page=0&page_size=50
+GET /webhook-deliveries?status=exhausted&page=0&page_size=50
 ```
 
-Returns a paginated list of batches with aggregated task statistics. Supports filtering by task name, kind, status, and creation time range.
+Returns `200` with delivery records ordered by `updated_at DESC, id DESC`. The optional case-insensitive `status` accepts `pending`, `success`, `failure`, or `exhausted`; invalid values return `400`.
 
-Response `200 OK` with array of batch summaries.
+Each record contains event and subject IDs, trigger, condition, idempotency key, status, attempts, next-attempt time, timestamps, and last error. See [delivery inspection](webhooks.md#inspecting-deliveries) for status semantics. There is no replay endpoint.
 
-## DAG Visualization
+## Health and metrics
 
-### Get DAG Data
-```http
-GET /dag/{batch_id}
-```
+| Endpoint | Behavior |
+|----------|----------|
+| `GET /health` | Always `200`; body reports `status: "ok"` or `"degraded"`, database health, `pool_size`, and `pool_idle` |
+| `GET /ready` | `200` with `{"status":"ready"}` when a connection can be acquired; `503` when the pool is exhausted or acquisition fails |
+| `GET /metrics` | Prometheus-format metrics; requires the bearer token when configured |
 
-Returns tasks and links for a batch in JSON format:
-```json
-{
-  "tasks": [
-    {"id": "uuid", "name": "...", "kind": "...", "status": "Running", "priority": 0, ...}
-  ],
-  "links": [
-    {"parent_id": "uuid", "child_id": "uuid", "requires_success": true}
-  ]
-}
-```
-
-### View DAG UI
-```http
-GET /view?batch={batch_id}
-```
-
-Opens the built-in DAG visualization UI with:
-- Cytoscape.js with Dagre auto-layout
-- Color-coded nodes by status
-- Click on nodes for task details
-- Auto-refresh option (5s interval)
-- Pan, zoom, and fit controls
-
-## Metrics
-```http
-GET /metrics
-```
-
-Prometheus-format metrics (see [Metrics catalog](metrics.md)).
-
-## Webhook Execution
-
-When a task starts, the `on_start` webhook is called with a `?handle=<host_url>/task/<task_id>` query parameter. This allows the webhook target to update the task status directly.
-
-Webhook params:
-```json
-{
-  "url": "https://example.com/webhook",
-  "verb": "Post",
-  "body": {"optional": "json payload"},
-  "headers": {"X-Custom": "header value"}
-}
-```
-
-Supported HTTP verbs: `Get`, `Post`, `Put`, `Patch`, `Delete`.
-
-The runner sends these headers on webhook requests:
-- `Idempotency-Key`: `"<task_id>:start"`, `"<task_id>:end:success"`, `"<task_id>:end:failure"`, `"<task_id>:cancel"`
-- `X-Task-Id`: task UUID
-- `X-Task-Trigger`: `start`, `end`, or `cancel`
-
-The `on_start` webhook response body can optionally contain a `NewActionDto` JSON to register a cancel action for the task.
+Probe connection acquisition has a two-second bound. Use `/health` for liveness and `/ready` for traffic readiness. See [Metrics](metrics.md) for the catalog.

@@ -1,63 +1,168 @@
-# Webhook Delivery (Transactional Outbox)
+# Webhooks
 
-See also: [architecture.md](architecture.md) (lifecycle, schema), [workers.md](workers.md) (worker loops).
+ArcRun calls external services to start work and report lifecycle events. Receivers should acknowledge requests promptly and make their side effects idempotent.
 
-## Split outbox: queue vs ledger/history (Audit 2, D3)
+## Events
 
-The webhook outbox is **two tables**:
+| Configuration | When called | Execution |
+|---------------|-------------|-----------|
+| `on_start` | After the scheduler claims a task | The start worker waits for the HTTP result |
+| `on_success` | A task reaches Success | Durable queue with retries |
+| `on_failure` | A task reaches Failure, including timeout or dependency failure | Durable queue with retries |
+| Cancel action | A Claimed/Running task is canceled | Durable queue with retries |
+| `on_batch_complete` | All inserted tasks in a batch are terminal | Durable queue with retries |
 
-- **`webhook_outbox`** — the at-least-once delivery QUEUE for end/cancel/batch_complete. A pure queue: every row present is awaiting delivery, so there is **no `status` column**. A row is enqueued inside the status-change transaction and **DELETED the moment delivery terminates**, keeping the table small, hot, and vacuum-friendly.
-- **`webhook_execution`** — the idempotency LEDGER (on_start gate; unchanged) **and** the delivery HISTORY/log. When a queued delivery ends, it is historised here as `success` or `exhausted` (moved out of the queue in the SAME statement — a `WITH del AS (DELETE … RETURNING *) INSERT … SELECT FROM del`). Retained for `GET /webhook-deliveries`.
+The required `on_start` field contains one action. Success, failure, and batch-complete fields contain arrays of actions. A cancel action is registered through the start receiver's response.
 
-The two tables are kept **disjoint per `idempotency_key`** by:
-- the **enqueue backstop** `INSERT INTO webhook_outbox … SELECT … WHERE NOT EXISTS (SELECT 1 FROM webhook_execution WHERE idempotency_key = $key) ON CONFLICT DO NOTHING` — once an event is in the ledger in ANY state it has already been delivered/given-up, so it is never re-queued (this replaces the pre-D3 `ON CONFLICT`-against-the-retained-`success`-row guard, e.g. a double `stop_batch` after the batch_complete already delivered);
-- the DELETE-then-INSERT on terminal (a key leaves the queue exactly as it enters the history).
+## Action format
 
-The `record_batch_completed` metric still counts only a real insert (`rows > 0`), so a re-signal blocked by either guard is not double-counted.
+```json
+{
+  "kind": "Webhook",
+  "params": {
+    "url": "https://worker.example.com/jobs",
+    "verb": "Post",
+    "headers": {"Authorization": "Bearer receiver-token"},
+    "body": {"job": "import"}
+  }
+}
+```
 
-## Delivery Contract (Lot 2)
+Supported verbs are `Get`, `Post`, `Put`, `Patch`, and `Delete`. Headers and body are optional. A successful response is any 2xx status. Each request has a 10-second timeout; redirects are rejected. Response bodies are bounded to 64 KiB. An oversized start response fails the start; an oversized successful notification response is truncated.
 
-End and cancel webhooks are **at-least-once notifications** delivered via a transactional outbox (`webhook_outbox`, the queue; see D3 above), not fired inline in the request/worker call path:
+The configured headers authenticate ArcRun to the receiver. They do not configure authentication for the receiver's callback to ArcRun.
 
-1. **API response = durable state.** When `PATCH /task/{id}` (or cancel/timeout/stop_batch) responds, the status transition, all propagation, AND the outbox rows for the end/cancel notifications are committed in one transaction. No reqwest runs in the call path, so the connection is released immediately (no pool starvation from slow consumers).
-2. **At-least-once delivery.** Every lifecycle notification (end, cancel) is delivered at least once, surviving crash/redeploy (the queued `webhook_outbox` row is durable). Consumers dedupe via the `Idempotency-Key` header (= `idempotency_key(task_id, trigger, condition)`).
-3. **Ordering.** No order guaranteed *between* tasks (a parent's `on_success` may arrive after a child's `on_start`). Order guaranteed *per task*: `start` is delivered before `end` (the delivery loop holds an `end`/`cancel` row until the task's `start` row is no longer `pending`). This gate is **bounded by freshness** (Audit 2, A2): it only holds while the pending `start` row's `updated_at > now() - WORKER_CLAIM_TIMEOUT_SECS`. A start row that never completes (crash between `mark_task_running` and its completion, or a Claimed task canceled mid-webhook) eventually goes stale and stops blocking, so end/cancel deliver anyway — a deliberate relaxation (better than an eternal block; start-before-end still holds for healthy starts). The nominal path closes the crash window by committing `mark_task_running` and the start-row completion in one transaction (`execute_webhook_for_task`).
-4. **`on_start` is control-flow, NOT a notification.** It stays synchronous in `start_loop` (its response can register a cancel action; its failure marks the task Failed). It does **not** go through the outbox. The webhook-supplied cancel action is persisted **inside** the same transaction that completes the `start` outbox row and transitions Claimed→Running (`execute_webhook_for_task`, Audit 2 A4) — even when the task already left `Claimed` while on_start was in flight (`mark_task_running` returns false). Committing it atomically with the start-row completion guarantees it is visible before the start-before-end gate can release the task's cancel row (validation is best-effort: invalid actions are logged + skipped, never rolling back the transition).
-5. **Cancel notifications cover the whole webhook-in-flight window.** `cancel_task`, `stop_batch`, and dead-end cancellation enqueue a `cancel` outbox row for a task that is `Running` **OR `Claimed`** (A4). `Claimed` is not "on_start never called" — it spans the entire on_start-in-flight window, so a consumer that received on_start and started work always gets a cancel. A Claimed task that never returned a cancel action prefetches zero cancel actions ⇒ fast-path `success` (no HTTP), so the broadened enqueue is innocuous. The permit-wait sub-window (task claimed but its `start` row not yet created, so a cancel row is not gated and can drain as zero-action before on_start fires) is closed too: `start_task` re-checks the task's status right after creating the start row and, if it left `Claimed`, skips on_start entirely and completes the start row (nothing executed ⇒ the zero-action cancel was correct).
+## Starting work and reporting completion
 
-**Outbox enqueue is unconditional** (a queue row is inserted even if the task has no matching action); the delivery loop marks zero-action rows `success` immediately (DELETE from the queue + `success` history row). This keeps the transition transaction minimal (one INSERT, no action lookup). The enqueue backstop (`WHERE NOT EXISTS (ledger)` + `ON CONFLICT (idempotency_key) DO NOTHING`) makes re-runs of a transition idempotent.
+Task-level requests include a URL-encoded `handle` query parameter containing `${HOST_URL}/task/{task_id}`. The receiver should accept the work, respond promptly, and later report completion to this URL:
 
-End/cancel webhook bodies are enriched with the task's final status + `ended_at` + trigger under a reserved `arcrun` key (merged non-destructively into any custom body). Inspect deliveries via `GET /webhook-deliveries?status=exhausted`.
+```http
+PATCH /task/{task_id}
+Content-Type: application/json
+Authorization: Bearer <arcrun-token>
 
-### `GET /webhook-deliveries`
+{"status":"Success"}
+```
 
-The response contract is unchanged (same fields, `?status=` filter). Semantics after D3: `pending` = rows still in the `webhook_outbox` queue (projected with a synthetic `pending` status) **plus** any pending `start` rows still in the ledger; `success`/`failure`/`exhausted` = ledger/history rows in `webhook_execution`. Implementation: a `UNION ALL` of both tables projected onto the same shape for the pending/unfiltered views (ordered `updated_at DESC, id DESC`), and the ledger only for a non-pending status filter (the queue can hold no such rows).
+Include Authorization when ArcRun has `AUTH_TOKEN` configured. The callback URL itself contains no credential. Failure reports use `{"status":"Failure","failure_reason":"description"}`.
 
-## Delivery Loop
+A successful start response means the service accepted the work; it does not complete the task. A start request that fails marks the task Failure. Start execution is tracked separately from the notification queue and does not use its retry schedule.
 
-(`delivery_loop`, `src/workers/delivery_loop.rs`) — the webhook outbox drainer, 5th worker. `run_delivery_once` runs in **four phases** instead of one long transaction (so HTTP never holds a lock or a connection, and deliveries within a batch run in parallel):
+### Registering cancellation
 
-1. **Claim (short tx, lease).** `claim_due_outbox_leased` selects mature rows from `webhook_outbox` (every row is a pending delivery, so the only maturity predicate is `next_attempt_at <= now()`, plus `FOR UPDATE SKIP LOCKED`; gated so an `end`/`cancel` row waits until the task's `start` row is no longer `pending` **in the ledger** — per-task ordering, **bounded by freshness**: the gate only holds while the pending `start` row's `updated_at > now() - WORKER_CLAIM_TIMEOUT_SECS` (passed as `start_stale_secs`) — Audit 2, A2) AND pushes their `next_attempt_at = now() + WEBHOOK_DELIVERY_LEASE_SECS` in one `UPDATE … FROM (SELECT … FOR UPDATE SKIP LOCKED) … RETURNING` statement, assigns a fresh fencing token, then commits. The **lease** is a soft lock: a concurrent worker / next iteration won't re-claim a leased row; on crash mid-delivery the lease expires and the row matures again (at-least-once). Success/retry/exhausted marks must carry the current token, so a worker finishing after a reclaim is a no-op. The lease does **not** bump `attempts`.
-2. **Prefetch (autocommit reads).** For each row, load its delivery inputs (task + actions, or `batch.on_complete` + stats — terminal state is immutable, so the reads are stable). Fast-paths resolved here: task/batch gone ⇒ mark `success`; malformed batch payload ⇒ `exhausted`; zero actions ⇒ `success`.
-3. **Deliver (parallel, no DB).** HTTP executions run concurrently via `futures_util::stream::buffer_unordered(WEBHOOK_DELIVERY_CONCURRENCY)`; no connection is held during HTTP. Actions of a *single* row stay sequential.
-4. **Mark (short autocommit statements).** Each outcome is posted with the `mark_outbox_*` helpers: success ⇒ DELETE the queue row + INSERT a `success` history row (one atomic CTE); failure ⇒ UPDATE the queue row (`attempts+1`, `last_error`, `next_attempt_at = now() + backoff`, overwriting the lease; row stays queued); after `WEBHOOK_MAX_ATTEMPTS` ⇒ DELETE the queue row + INSERT an `exhausted` history row + metric. A failed mark is logged and skipped (it does **not** roll back marks already posted for other rows; the lease re-delivers — at-least-once).
+The start receiver can return an action as its JSON response body:
 
-Exposed as `run_delivery_once` for deterministic test driving (signature unchanged: `(evaluator, conn, cfg)` → number of rows processed).
+```json
+{
+  "kind": "Webhook",
+  "params": {
+    "url": "https://worker.example.com/jobs/import-42/cancel",
+    "verb": "Post"
+  }
+}
+```
 
-## Batch-complete detection (`BatchComplete` trigger — Lot 3b, reworked by Audit 2 D2)
+ArcRun validates and stores this action with the start result. Invalid cancel actions are logged and skipped. Cancellation can occur while the task is Claimed and the start call is still in flight, so cancel notifications cover both Claimed and Running tasks.
 
-Detection is driven by a denormalized counter **`batch.remaining`** = number of the batch's tasks not yet terminal (Audit 2, D2 — replaces the old `FOR UPDATE` on the `batch` row + `NOT EXISTS (task active)` probe, and the B3 partial index that served it). `remaining` is initialized at insert (`init_batch_remaining`) to the number of tasks **actually inserted** (dedupe-skips excluded; 0 ⇒ the vacuously-complete batch signals immediately). Every transaction that terminalizes tasks calls `decrement_batch_remaining_for_tasks` (`src/db/webhook_execution.rs`) with **all** the ids it terminalized (origin + cascade-failed children + dead-end-canceled ancestors): one `UPDATE batch SET remaining = GREATEST(remaining - N, 0) … RETURNING remaining, (on_complete <> '[]')` per batch — atomic, O(1), naturally serialized on the `batch` row (two transactions finishing the last two tasks each apply their own decrement; exactly one observes 0).
+## Event identity
 
-`remaining = 0` **is** the completion signal ⇒ enqueue one `webhook_outbox` row keyed `batch:<batch_id>:complete`, **gated on a non-empty `on_complete`** (#601: scope/metadata-only batches keep `remaining` maintained — free progress reporting, exposed as `remaining` in `GET /batches` — but never signal). The exactly-once contract: callers pass ONLY ids whose guarded terminal UPDATE actually matched (a re-PATCH/cancel/timeout of an already-terminal task never decrements); the unique idempotency key + the enqueue backstop (`NOT EXISTS (ledger)` + `ON CONFLICT DO NOTHING`, D3) remain as backstop — a re-signal after the batch_complete already delivered finds the delivered row in the ledger and does not re-queue.
+| Header | Value |
+|--------|-------|
+| `Idempotency-Key` | Stable event identifier, shown below |
+| `X-Task-Id` | Task UUID; absent for batch-complete events |
+| `X-Task-Trigger` | `start`, `end`, `cancel`, or `batch_complete` |
 
-Call sites: `update_running_task`, `fail_task_and_propagate` (`task_lifecycle.rs`), `timeout_task_and_propagate` (`task_query.rs`), `cancel_task` (`propagation.rs`), `add_task` (init/vacuous), and `stop_batch` which uses `zero_batch_remaining_and_complete` (mass-cancel ⇒ `remaining` set straight to 0).
+| Event | Idempotency key |
+|-------|-----------------|
+| Start | `<task_id>:start` |
+| Success | `<task_id>:end:success` |
+| Failure | `<task_id>:end:failure` |
+| Cancel | `<task_id>:cancel` |
+| Batch complete | `batch:<batch_id>:complete` |
 
-The delivery loop (`prepare_batch_complete_row` prefetch + `deliver_plan`) loads `batch.on_complete`, executes each action **without** a `?handle=`, with an `arcrun` body enrichment `{batch_id, counts:{success,failure,canceled}, completed_at}` (counts / `completed_at = max(ended_at)` computed at delivery time). Retry/backoff/exhausted are identical to task-level rows. Retention (`src/db/cleanup.rs`) also deletes orphaned `batch` rows (and their batch-level `webhook_outbox` + `webhook_execution` rows) once their tasks are gone — but never sweeps a batch that still has a `webhook_outbox` row (its batch_complete signal is still awaiting delivery); once delivered (the queue row is gone, a history row remains) the batch is swept normally.
+Keys identify events, not individual actions. Several actions attached to the same event receive the same key. If a receiver handles more than one such action, combine the event key with its own action or endpoint identity when deduplicating.
 
-## SSRF Protection
+Persist deduplication decisions with the receiver's side effects where possible. A network failure or an expired lease can cause a request to repeat even after the receiver performed the work.
 
-**Creation-time** (`src/validation.rs`): webhook URLs are validated at task/action creation. Matches on `url.host()` so **IPv6 literals** (`[::1]`, `[fd00::1]`, `[::ffff:10.0.0.1]`) are actually inspected — the old `host_str().parse::<IpAddr>()` failed on the bracketed form and let them through in release (Audit 2, A5). `is_internal_ip` unwraps IPv4-mapped v6. `validate_webhook_url_with_config` is `pub` (config-injected entry point; used by tests to exercise the strict path without the global `OnceLock`).
+## Notification payloads
 
-**Delivery-time resolver (Audit 2, A5)**: when SSRF validation is active (release / `SKIP_SSRF_VALIDATION=0`), `ActionExecutor` installs a custom reqwest DNS resolver (`SsrfGuardResolver`) that re-checks every resolved IP at request time and **refuses to connect if any is internal/reserved** (`is_internal_ip`, incl. IPv4-mapped v6) — closing the DNS-rebinding window (creation-time validation only saw the name; reqwest re-resolves at delivery, possibly across retries). A blocked resolution fails the delivery, which the outbox retries (at-least-once). **IP-literal URLs bypass this resolver** (reqwest connects to literals without DNS) — they are covered by the creation-time check. **Blocked hostnames/suffixes stay a creation-time concern** (the resolver filters only on the resolved IP). When SSRF is skipped (debug/tests), the stock resolver is used — unchanged behaviour, so tests webhooking to `127.0.0.1` keep working. Built via `ActionExecutor::with_security_config` (also the test seam for a strict executor without touching the global config).
+End and cancel requests add task information under the reserved `arcrun` key:
 
-**Allowlist** (`ALLOWED_HOSTNAMES` / `ALLOWED_CIDRS`, see `docs/configuration.md`): both gates honour it. A hostname matching `allowed_hostnames` (exact or `.suffix`) passes creation-time validation regardless of the blocklists and is resolved by `SsrfGuardResolver` without any IP check. A resolved IP (or IP literal) inside `allowed_cidrs` is accepted although private; other resolved IPs of the same name are still checked. Without an allowlist, a webhook to an internal service *name* (docker/k8s) is accepted at creation and fails at delivery — this is what broke on_start webhooks in the 2026-09-30 upgrade from v1.2.0. Webhook send/read failures are logged with the full error `source()` chain (`error_chain` in `src/action.rs`), so a refused resolution shows its `SSRF: … resolved to internal/reserved IP …` reason instead of reqwest's bare "error sending request".
+```json
+{
+  "job": "import",
+  "arcrun": {
+    "status": "Success",
+    "ended_at": "2026-10-01T10:00:00Z",
+    "trigger": "end"
+  }
+}
+```
+
+Custom object fields are preserved, except a custom `arcrun` field is replaced. A non-object custom body is placed under `body`; an absent body produces only the `arcrun` object. Start requests use the configured body without this enrichment.
+
+### Batch completion
+
+Register `on_batch_complete` in the object form of `POST /task`. ArcRun enqueues one completion event when the last inserted task becomes terminal. If all tasks are skipped by deduplication, the event is enqueued immediately. An event can be delivered more than once.
+
+Batch requests have no `handle` parameter and no `X-Task-Id`. Their body contains:
+
+```json
+{
+  "arcrun": {
+    "batch_id": "019a0000-0000-7000-8000-000000000001",
+    "counts": {"success": 8, "failure": 1, "canceled": 1},
+    "completed_at": "2026-10-01T10:00:00Z",
+    "trigger": "batch_complete"
+  }
+}
+```
+
+Counts refer to tasks in each terminal state, not their item-progress counters. The payload is computed at delivery time. Completion time is the latest task `ended_at`, with an event-timestamp fallback for a batch with no inserted tasks.
+
+## Durability, ordering, and retries
+
+End, cancel, and batch-complete events are enqueued in the same transaction as their associated state changes. The API response therefore confirms durable state and queueing, not successful delivery.
+
+Failed notification attempts retry with `min(base^attempts, cap)` seconds of delay. With the default configuration, retry delays begin at 2, 4, and 8 seconds and stop growing at 300 seconds. After 10 failed attempts the event becomes `exhausted`. There is no guarantee of successful receipt when the receiver remains unavailable.
+
+A retry repeats the event's action sequence, so actions that succeeded before a later action failed may receive duplicates. Inspect exhausted events through `GET /webhook-deliveries?status=exhausted`; there is no HTTP endpoint for replaying them.
+
+There is no delivery order across tasks. A child's start may arrive before its parent's success notification. For one task, end/cancel delivery waits while a fresh start execution is pending. This gate expires after `WORKER_CLAIM_TIMEOUT_SECS`, so a crashed start cannot block notifications indefinitely. Start-before-end ordering is therefore bounded by that freshness window.
+
+## Delivery loop
+
+The delivery worker processes a batch in four phases:
+
+1. **Claim:** select due queue rows with `FOR UPDATE SKIP LOCKED`, assign a fresh lease token, and defer their eligibility by `WEBHOOK_DELIVERY_LEASE_SECS` in a short transaction.
+2. **Prepare:** load task or batch data and actions. Events with no actions, or whose subject no longer exists, are marked successful without HTTP. Malformed batch action data is exhausted.
+3. **Send:** deliver up to `WEBHOOK_DELIVERY_CONCURRENCY` events concurrently, with sequential actions within each event.
+4. **Record:** move successful or exhausted events into history; update failed events with another attempt and retry time.
+
+Every result write checks the lease token. A worker finishing after another worker reclaimed the event cannot overwrite its state. Failed result writes leave the event recoverable after lease expiry.
+
+HTTP runs outside transactions and row locks. The current implementation retains one pool connection for the full iteration, including HTTP execution. The lease must cover time waiting within a delivery batch as well as the sequential actions for an event.
+
+## Inspecting deliveries
+
+`GET /webhook-deliveries` supports `page`, `page_size`, and an optional case-insensitive `status` filter:
+
+| Status | Meaning |
+|--------|---------|
+| `pending` | Queued notification, leased notification, scheduled retry, or pending start execution |
+| `success` | Start execution succeeded or notification finished successfully; may include events with no actions |
+| `failure` | Failed start-execution record |
+| `exhausted` | Notification stopped retrying or could not be prepared |
+
+Results include subject IDs, trigger, condition, idempotency key, attempt count, next-attempt time, timestamps, and last error. They are ordered by most recent update, then ID. Notification retries remain `pending`; they do not appear under `failure`.
+
+## SSRF protection
+
+With validation enabled, ArcRun checks webhook URLs at creation and checks resolved IP addresses again when delivering. Private and reserved addresses are blocked, including IPv4-mapped IPv6 addresses. IP-literal URLs are checked at creation; hostname resolution is checked during HTTP delivery. Redirects are disabled.
+
+For trusted internal services, configure `ALLOWED_HOSTNAMES` or `ALLOWED_CIDRS`:
+
+- Hostnames support exact names and leading-dot suffixes, matched without case sensitivity. A match bypasses hostname blocklists and resolved-IP checks.
+- CIDRs allow specific networks or individual IPs. Other addresses returned by the same DNS lookup must still pass validation.
+
+Release builds enable these checks by default; debug builds skip them unless `SKIP_SSRF_VALIDATION=0`. See [Configuration](configuration.md#security) for the settings.

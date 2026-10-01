@@ -616,7 +616,8 @@ pub async fn cancel_task<'a>(
                 enqueue_cancel_outbox(&task_id, conn).await?;
             }
             for child_id in &cascade_failed {
-                enqueue_end_outbox(child_id, StatusKind::Failure, conn).await?;
+                enqueue_end_outbox(child_id, crate::notification::TerminalStatus::FAILURE, conn)
+                    .await?;
             }
             enqueue_outbox_for_canceled_ancestors(&canceled_ancestors, conn).await?;
 

@@ -20,12 +20,12 @@ const features: {title: string; description: string}[] = [
   {
     title: 'Webhook actions',
     description:
-      'on_start / on_end / on_cancel webhooks, delivered at-least-once through a transactional outbox with retries.',
+      'Start work through on_start webhooks, then deliver end and cancel notifications through a durable queue with retries.',
   },
   {
     title: 'Batch lifecycle',
     description:
-      'Batch stats, stop, live rule updates, high-throughput counters and an exactly-once batch-complete webhook.',
+      'Batch progress, cancellation, rule updates and durable completion notifications with retries.',
   },
   {
     title: 'Observability',
@@ -42,8 +42,8 @@ const features: {title: string; description: string}[] = [
 const quickStart = `docker pull plawn/arcrun:latest
 
 docker run -e DATABASE_URL=postgres://user:pass@host/db \\
-  -e HOST_URL=http://localhost:8080 \\
-  -p 8080:8080 plawn/arcrun:latest`;
+  -e HOST_URL=http://localhost:8085 \\
+  -p 8085:8085 plawn/arcrun:latest`;
 
 export default function Home(): ReactNode {
   const {siteConfig} = useDocusaurusContext();
@@ -58,7 +58,7 @@ export default function Home(): ReactNode {
           </Heading>
           <p className="hero__subtitle">{siteConfig.tagline}</p>
           <div style={{display: 'flex', gap: '1rem', justifyContent: 'center'}}>
-            <Link className="button button--secondary button--lg" to="/docs/openapi_description">
+            <Link className="button button--secondary button--lg" to="/docs/getting-started">
               Get started
             </Link>
             <Link className="button button--outline button--secondary button--lg" to="/docs/api">

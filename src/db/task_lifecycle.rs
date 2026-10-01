@@ -105,7 +105,7 @@ pub async fn update_running_task<'a>(
                         // (inside the tx, no reqwest in the call path).
                         workers::enqueue_end_outbox_with_cascade(
                             &task_id,
-                            *final_status,
+                            (*final_status).try_into()?,
                             &cascade,
                             conn,
                         )
@@ -321,8 +321,13 @@ pub(crate) async fn fail_task_and_propagate<'a>(
                 };
 
                 // Enqueue on_failure outbox rows (task + cascade + ancestors) in-tx.
-                workers::enqueue_end_outbox_with_cascade(&tid, StatusKind::Failure, &cascade, conn)
-                    .await?;
+                workers::enqueue_end_outbox_with_cascade(
+                    &tid,
+                    crate::notification::TerminalStatus::FAILURE,
+                    &cascade,
+                    conn,
+                )
+                .await?;
                 workers::enqueue_outbox_for_canceled_ancestors(&ancestors, conn).await?;
 
                 // Batch-complete detection (D2): decrement `batch.remaining` for the

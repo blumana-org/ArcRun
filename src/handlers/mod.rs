@@ -236,7 +236,7 @@ pub async fn get_conn_with_retry<'a>(
     ),
     info(
         title = "ArcRun API",
-        version = "0.1.0",
+        version = "1.3.0",
         description = include_str!("../../docs/openapi_description.md"),
     )
 )]

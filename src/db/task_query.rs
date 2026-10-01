@@ -142,7 +142,7 @@ pub(crate) async fn timeout_task_and_propagate<'a>(
             // Enqueue on_failure outbox rows (task + cascade + ancestors) in-tx.
             crate::workers::enqueue_end_outbox_with_cascade(
                 &task_id,
-                models::StatusKind::Failure,
+                crate::notification::TerminalStatus::FAILURE,
                 &cascade_failed,
                 conn,
             )

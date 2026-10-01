@@ -42,14 +42,14 @@ pub struct NewTaskDto {
     /// their `dependencies` array.
     pub id: String,
 
-    /// Human-readable name for the task. Must be non-empty, max 255 characters.
+    /// Human-readable name for the task. Must be non-empty, max 255 UTF-8 bytes.
     pub name: String,
 
     /// Task category/type. Used for concurrency rule matching and filtering. Must be non-empty,
-    /// max 100 characters. Examples: "ci", "deploy", "clustering", "etl".
+    /// max 100 UTF-8 bytes. Examples: "ci", "deploy", "clustering", "etl".
     pub kind: String,
-    /// Maximum execution time in seconds. If a Running task exceeds this, it is marked as Failure.
-    /// Must be positive, max 86400 (24 hours). Defaults to a server-side value if omitted.
+    /// Maximum inactivity time in seconds while Running, measured from last_updated.
+    /// Must be positive, max 86400 (24 hours). Defaults to 60 seconds.
     pub timeout: Option<i32>,
     /// Arbitrary JSON metadata attached to the task. Used for concurrency rule matching (via
     /// Matcher.fields) and deduplication. Max 64KB. Example: `{"projectId": "abc", "env": "prod"}`
@@ -63,7 +63,7 @@ pub struct NewTaskDto {
     /// given kind can run concurrently. The worker checks these rules before starting a Pending task.
     pub rules: Option<Rules>,
 
-    /// Webhook action called when the worker starts this task (transitions Pending -> Running).
+    /// Webhook action called after the worker claims this task (Pending -> Claimed).
     /// The webhook receives a `?handle=<callback_url>` query parameter for reporting completion.
     /// The webhook response body can optionally return a `NewActionDto` JSON to register a cancel action.
     pub on_start: NewActionDto,
@@ -72,7 +72,7 @@ pub struct NewTaskDto {
     /// and transitions to `Pending` only when all dependencies are met.
     pub dependencies: Option<Vec<Dependency>>,
 
-    /// Expected total count for progress tracking. Purely informational — the task is NOT
+    /// Expected item count for progress tracking and Capacity rules. The task is NOT
     /// auto-completed when `success + failures` reaches this value. Use it to compute
     /// `progress = (success + failures) / expected_count`. Must be >= 0 if provided.
     pub expected_count: Option<i32>,
@@ -92,14 +92,14 @@ pub struct NewTaskDto {
 }
 
 /// Object form of the `POST /task` body. Carries the task array plus an optional
-/// batch-level `on_batch_complete` webhook fired once when the LAST task of the
-/// batch reaches a terminal state.
+/// batch-level `on_batch_complete` event enqueued when all inserted tasks are terminal.
+/// Notification delivery may repeat.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateTaskBatchDto {
     /// The tasks to create (same semantics as the bare-array form).
     pub tasks: Vec<NewTaskDto>,
-    /// Webhook actions fired exactly once (at-least-once delivery) when the last
-    /// task of this batch becomes terminal. Executed without a `?handle=` param;
+    /// Webhook actions queued as one event when the last inserted task becomes
+    /// terminal. Delivery may repeat; receivers must deduplicate. No `?handle=` param is sent;
     /// the request body carries an `arcrun` object with `batch_id`, per-status
     /// `counts`, and `completed_at`.
     pub on_batch_complete: Option<Vec<NewActionDto>>,
@@ -122,7 +122,7 @@ pub struct BatchParts {
 /// The accepted shapes of the `POST /task` request body.
 ///
 /// Untagged + backwards compatible: the existing bare array `[NewTaskDto, …]` still
-/// works exactly as before, OR an object `{ "tasks": [...], "on_batch_complete": [...] }`.
+/// is supported, or an object `{ "tasks": [...], "on_batch_complete": [...] }`.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum CreateTaskBody {
@@ -196,7 +196,7 @@ pub struct BasicTaskDto {
     pub priority: i32,
 }
 
-/// Targeted `SELECT` projection for building a [`BasicTaskDto`] (Audit 2, B7).
+/// Targeted `SELECT` projection for building a [`BasicTaskDto`].
 ///
 /// Listings and `get_dag_for_batch` produce `BasicTaskDto`s, which carry none of
 /// the heavy JSONB columns (`metadata`, `start_condition` — up to 64 KiB each).
@@ -369,7 +369,8 @@ pub struct WebhookDeliveryDto {
     pub condition: TriggerCondition,
     /// The `Idempotency-Key` header sent to the consumer.
     pub idempotency_key: String,
-    /// Delivery status: pending, success, failure (transient), or exhausted (gave up).
+    /// Delivery status: pending, success, failure (failed start), or exhausted.
+    /// Notifications awaiting retry remain pending.
     pub status: WebhookExecutionStatus,
     /// Number of delivery attempts made so far.
     pub attempts: i32,

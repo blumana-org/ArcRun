@@ -54,9 +54,9 @@ impl PaginationDto {
 /// Filter parameters for task listing. All filters are optional and combined with AND logic.
 #[derive(Debug, Serialize, Deserialize, Default, IntoParams)]
 pub struct FilterDto {
-    /// Filter by task name (exact match).
+    /// Filter by task name (substring match).
     pub name: Option<String>,
-    /// Filter by task kind (exact match). Example: "ci", "deploy".
+    /// Filter by task kind (substring match). Example: "ci", "deploy".
     pub kind: Option<String>,
     /// Filter by task status. Example: "Running", "Pending", "Success".
     pub status: Option<StatusKind>,
