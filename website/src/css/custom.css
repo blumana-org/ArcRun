@@ -1,0 +1,34 @@
+/**
+ * Global styles. Infima (the default Docusaurus CSS framework) is bundled by
+ * the classic preset; only the primary palette is overridden here.
+ */
+
+:root {
+  --ifm-color-primary: #3b5bdb;
+  --ifm-color-primary-dark: #3451c9;
+  --ifm-color-primary-darker: #314dbe;
+  --ifm-color-primary-darkest: #283f9c;
+  --ifm-color-primary-light: #4d6ae0;
+  --ifm-color-primary-lighter: #5873e2;
+  --ifm-color-primary-lightest: #7a90e8;
+  --ifm-code-font-size: 95%;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+}
+
+[data-theme='dark'] {
+  --ifm-color-primary: #91a7ff;
+  --ifm-color-primary-dark: #7390ff;
+  --ifm-color-primary-darker: #6484ff;
+  --ifm-color-primary-darkest: #3660ff;
+  --ifm-color-primary-light: #afbeff;
+  --ifm-color-primary-lighter: #becaff;
+  --ifm-color-primary-lightest: #ebefff;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+}
+
+/* The docs contain wide tables (config reference, metrics catalog). */
+.markdown table {
+  display: table;
+  width: 100%;
+  font-size: 0.9rem;
+}

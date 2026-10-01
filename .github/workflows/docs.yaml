@@ -1,0 +1,80 @@
+name: Docs
+
+# Builds the Docusaurus site (website/) from docs/ and publishes it to
+# GitHub Pages: https://tinyest-org.github.io/ArcRun/
+#
+# One-time setup: Settings > Pages > Source must be set to "GitHub Actions".
+
+on:
+  push:
+    branches:
+      - "master"
+      - "main"
+    paths:
+      - "docs/**"
+      - "website/**"
+      - ".github/workflows/docs.yaml"
+  pull_request:
+    branches:
+      - "master"
+      - "main"
+    paths:
+      - "docs/**"
+      - "website/**"
+      - ".github/workflows/docs.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+        working-directory: website
+
+      - name: Typecheck
+        run: bun run typecheck
+        working-directory: website
+
+      - name: Build site
+        run: bun run build
+        working-directory: website
+
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/build
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
