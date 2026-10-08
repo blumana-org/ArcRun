@@ -31,7 +31,8 @@
 //!    are stable. The fast-paths (task/batch gone ⇒ success; malformed batch payload ⇒
 //!    exhausted; zero actions ⇒ success) are resolved here, before any HTTP.
 //! 3. **Deliver (parallel, no DB).** The HTTP executions run concurrently, bounded by
-//!    `concurrency`, via `buffer_unordered`. No transaction or row lock is held during HTTP; the caller retains its pool connection.
+//!    `concurrency`, via `buffer_unordered`. The connection is returned to the pool
+//!    before HTTP; no connection, transaction, or row lock is held during delivery.
 //!    Actions of a *single* row stay sequential (unchanged behaviour).
 //! 4. **Mark (short autocommit statements).** Each outcome is committed with the
 //!    existing `mark_outbox_*` helpers. A failed mark is logged and skipped — it does
@@ -62,8 +63,8 @@ pub struct DeliveryConfig {
     pub backoff_base_secs: i64,
     pub backoff_cap_secs: i64,
     /// Lease (seconds) applied to a row at claim time: it stays "in-flight" (not
-    /// re-claimable) until the lease expires. Must exceed the worst-case single-row
-    /// delivery time.
+    /// re-claimable) until the lease expires. Must cover the wait within the batch
+    /// as well as the worst-case delivery time of an individual row.
     pub lease_secs: i64,
     /// Max concurrent HTTP deliveries within one `run_delivery_once` batch.
     pub concurrency: usize,
@@ -91,16 +92,19 @@ pub async fn delivery_loop(
 
     loop {
         let loop_start = std::time::Instant::now();
-        if let Ok(mut conn) = pool.get().await {
-            match run_delivery_once(evaluator.as_ref(), &mut conn, cfg).await {
-                Ok(0) => log::debug!("Delivery worker: no mature outbox rows"),
-                Ok(n) => log::debug!("Delivery worker: processed {} outbox rows", n),
-                Err(e) => log::error!("Delivery worker: error draining outbox: {:?}", e),
-            }
+        let result = run_delivery_once(evaluator.as_ref(), &pool, cfg).await;
+        let sample_backlog =
+            result.is_ok() && last_backlog_sample.elapsed() >= BACKLOG_SAMPLE_INTERVAL;
+        match result {
+            Ok(0) => log::debug!("Delivery worker: no mature outbox rows"),
+            Ok(n) => log::debug!("Delivery worker: processed {} outbox rows", n),
+            Err(e) => log::error!("Delivery worker: error draining outbox: {:?}", e),
+        }
 
-            // Nudges can make this loop run many times per second. Backlog gauges do
-            // not need request-path freshness, so cap the aggregate scan frequency.
-            if last_backlog_sample.elapsed() >= BACKLOG_SAMPLE_INTERVAL {
+        // Nudges can make this loop run many times per second. Backlog gauges do
+        // not need request-path freshness, so cap the aggregate scan frequency.
+        if sample_backlog {
+            if let Ok(mut conn) = pool.get().await {
                 match db_operation::outbox_backlog_stats(&mut conn).await {
                     Ok(stats) => metrics::set_webhook_outbox_backlog(
                         stats.ready,
@@ -109,10 +113,10 @@ pub async fn delivery_loop(
                     ),
                     Err(e) => log::warn!("Delivery worker: outbox backlog stats failed: {:?}", e),
                 }
-                last_backlog_sample = Instant::now();
+            } else {
+                log::warn!("Delivery worker: failed to acquire connection for backlog stats");
             }
-        } else {
-            log::error!("Delivery worker: failed to acquire DB connection");
+            last_backlog_sample = Instant::now();
         }
         metrics::record_worker_loop_iteration("delivery", loop_start.elapsed().as_secs_f64());
 
@@ -138,15 +142,20 @@ pub async fn delivery_loop(
 /// can drive delivery deterministically instead of waiting on the timer.
 ///
 /// Four phases (see module docs): short claim tx (with lease), out-of-tx prefetch,
-/// parallel HTTP delivery, then short mark statements. The single `conn` is used only
-/// for the DB phases (claim / prefetch / marks); the caller retains the connection during the HTTP phase, outside a transaction.
-pub async fn run_delivery_once<'a>(
-    evaluator: &'a ActionExecutor,
-    conn: &mut Conn<'a>,
+/// parallel HTTP delivery, then short mark statements. Borrow a connection for
+/// claim/prefetch, return it before HTTP, and reacquire once for the result batch.
+/// If reacquisition fails, the leased rows remain available for a later retry.
+pub async fn run_delivery_once(
+    evaluator: &ActionExecutor,
+    pool: &DbPool,
     cfg: DeliveryConfig,
 ) -> Result<usize, db_operation::DbError> {
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| db_operation::DbError::Pool(e.to_string()))?;
     // Phase 1 — claim with lease (short transaction).
-    let claimed = db_operation::run_in_transaction(conn, |conn| {
+    let claimed = db_operation::run_in_transaction(&mut conn, |conn| {
         let batch_size = cfg.batch_size;
         let lease = cfg.lease_secs;
         let start_stale = cfg.start_stale_secs;
@@ -164,14 +173,18 @@ pub async fn run_delivery_once<'a>(
     // Phase 2 — prefetch delivery inputs (autocommit reads). Fast-path marks are
     // collected separately so they don't need an HTTP round-trip.
     let mut plans: Vec<DeliveryPlan> = Vec::with_capacity(claimed.len());
-    for prepared in prepare_rows(conn, claimed).await? {
+    for prepared in prepare_rows(&mut conn, claimed).await? {
         match prepared {
-            Prepared::Mark(mark) => apply_mark(conn, mark).await,
+            Prepared::Mark(mark) => apply_mark(&mut conn, mark).await,
             Prepared::Deliver(plan) => plans.push(plan),
         }
     }
+    drop(conn);
+    if plans.is_empty() {
+        return Ok(processed);
+    }
 
-    // Phase 3 — deliver in parallel (no DB transaction or row lock held).
+    // Phase 3 — deliver in parallel without retaining a pooled connection.
     let outcomes: Vec<DeliveryOutcome> = stream::iter(plans.into_iter().map(|plan| {
         let evaluator = &*evaluator;
         async move { deliver_plan(evaluator, plan, cfg).await }
@@ -180,9 +193,14 @@ pub async fn run_delivery_once<'a>(
     .collect()
     .await;
 
-    // Phase 4 — post results (short autocommit statements; failures don't cascade).
+    // Phase 4 — reacquire once for all results, preserving batched pool access.
+    // Short autocommit statements; each mark still checks the original lease token.
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| db_operation::DbError::Pool(e.to_string()))?;
     for outcome in outcomes {
-        apply_mark(conn, outcome.mark).await;
+        apply_mark(&mut conn, outcome.mark).await;
     }
 
     Ok(processed)

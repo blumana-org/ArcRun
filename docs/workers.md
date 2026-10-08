@@ -35,6 +35,8 @@ Rules map to canonical keys based on rule type, matcher, and metadata values. Ad
 
 Concurrency rules reserve one unit. Capacity rules reserve the task's remaining work, `max(expected_count - success - failures, 0)`. Admission checks the existing capacity charge before adding the candidate, so a newly admitted task can take the total above the threshold.
 
+Claims verify that the rules still match the scheduler's snapshot. If a batch-rules edit wins the race, the claim rolls back all reservations and a later scan evaluates the new rules. The batch fast path likewise checks that each task still has no rules.
+
 Only tasks admitted through a rule key occupy that key's reservations. Matching tasks without the rule do not count. The consumed keys and capacity charge are stored on each task and released when it leaves Claimed/Running, including requeue after a stale claim.
 
 Counter flushes reduce capacity reservations as work completes. Direct PATCH updates do not adjust capacity reservations mid-run. A capacity charge only decreases until it is released, even if `expected_count` is later increased.
@@ -43,7 +45,7 @@ Counter flushes reduce capacity reservations as work completes. Direct PATCH upd
 
 Each iteration first requeues stale Claimed tasks whose activity timestamp is older than `WORKER_CLAIM_TIMEOUT_SECS`. Requeue releases their reservations and makes them Pending again.
 
-The worker then finds Running tasks whose `last_updated` exceeds their task-specific timeout. Each timeout commits Failure with reason `Timeout`, dependency propagation, reservation release, and failure-notification enqueue.
+The worker then finds Running tasks whose `last_updated` exceeds their task-specific timeout. It rechecks inactivity when locking each candidate, so progress persisted after the scan prevents a stale timeout. Each timeout commits Failure with reason `Timeout`, dependency propagation, reservation release, and failure-notification enqueue.
 
 Timed-out tasks are processed oldest first, in passes of at most `WORKER_TIMEOUT_BATCH_SIZE`. An iteration drains at most 50 full passes before yielding. This bounds the work between stale-claim checks.
 

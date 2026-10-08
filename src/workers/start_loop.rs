@@ -405,7 +405,7 @@ pub async fn run_claim_loop<'a>(conn: &mut Conn<'a>, claim_cap: i64, page_size: 
                 }
                 Ok(outcome) if outcome.result == db_operation::ClaimResult::AlreadyClaimed => {
                     log::debug!(
-                        "Start worker: task {} already claimed by another worker",
+                        "Start worker: task {} status or rules changed since the scan",
                         t.id
                     );
                 }
@@ -471,7 +471,7 @@ async fn flush_batch<'a>(
                     claimed.push(t);
                 } else {
                     log::debug!(
-                        "Start worker: task {} already claimed by another worker (batch)",
+                        "Start worker: task {} status or rules changed since the scan (batch)",
                         t.id
                     );
                 }

@@ -266,10 +266,9 @@ async fn test_parallel_delivery_is_concurrent() {
     }
 
     // One delivery pass must process all 4 rows concurrently.
-    let mut conn = state.pool.get().await.unwrap();
     let start = std::time::Instant::now();
     let processed =
-        arcrun::workers::run_delivery_once(&state.action_executor, &mut conn, lease_cfg())
+        arcrun::workers::run_delivery_once(&state.action_executor, &state.pool, lease_cfg())
             .await
             .unwrap();
     let elapsed = start.elapsed();
@@ -311,12 +310,10 @@ async fn test_failing_row_does_not_block_others() {
     let bad = task_with_success_webhook(&app, &state, "ind-bad", &bad_url).await;
 
     // One pass: good rows succeed, the bad row is rescheduled with backoff.
-    let mut conn = state.pool.get().await.unwrap();
     let processed =
-        arcrun::workers::run_delivery_once(&state.action_executor, &mut conn, lease_cfg())
+        arcrun::workers::run_delivery_once(&state.action_executor, &state.pool, lease_cfg())
             .await
             .unwrap();
-    drop(conn);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     assert_eq!(processed, 3, "all three rows processed in one pass");

@@ -99,14 +99,29 @@ pub(crate) async fn timeout_task_and_propagate<'a>(
     DbError,
 > {
     use super::run_in_transaction;
-    use {crate::schema::task::dsl::*, diesel::dsl::now};
+    use {
+        crate::schema::task::dsl::*,
+        diesel::{dsl::now, pg::data_types::PgInterval},
+    };
     const TIMEOUT_REASON: &str = "Timeout";
 
     run_in_transaction(conn, |conn| {
         Box::pin(async move {
-            // Lock the task; SKIP LOCKED so concurrent timeout workers don't block
+            // The scan is only a candidate list: progress may have committed since
+            // then. Recheck inactivity in the locking query, without an extra read.
+            // SKIP LOCKED also lets an in-flight progress update finish first.
             let t: Option<Task> = task
-                .filter(id.eq(task_id).and(status.eq(models::StatusKind::Running)))
+                .filter(
+                    id.eq(task_id)
+                        .and(status.eq(models::StatusKind::Running))
+                        .and(started_at.is_not_null())
+                        .and(
+                            last_updated.lt(now.into_sql::<sql_types::Timestamptz>()
+                                - (PgInterval::from_microseconds(1_000_000)
+                                    .into_sql::<sql_types::Interval>()
+                                    * timeout)),
+                        ),
+                )
                 .for_update()
                 .skip_locked()
                 .first::<Task>(conn)
@@ -114,7 +129,7 @@ pub(crate) async fn timeout_task_and_propagate<'a>(
                 .optional()?;
 
             let Some(t) = t else {
-                // Already transitioned (e.g. completed or cancelled concurrently)
+                // No longer overdue, already transitioned, or currently locked.
                 return Ok(None);
             };
 

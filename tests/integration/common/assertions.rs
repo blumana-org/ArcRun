@@ -172,8 +172,7 @@ pub async fn drain_outbox_with(
 ) -> usize {
     let mut total = 0usize;
     for _ in 0..max_passes {
-        let mut conn = state.pool.get().await.unwrap();
-        let n = arcrun::workers::run_delivery_once(&state.action_executor, &mut conn, cfg)
+        let n = arcrun::workers::run_delivery_once(&state.action_executor, &state.pool, cfg)
             .await
             .expect("run_delivery_once should not error");
         total += n;

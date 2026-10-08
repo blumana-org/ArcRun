@@ -141,7 +141,7 @@ The delivery worker processes a batch in four phases:
 
 Every result write checks the lease token. A worker finishing after another worker reclaimed the event cannot overwrite its state. Failed result writes leave the event recoverable after lease expiry.
 
-HTTP runs outside transactions and row locks. The current implementation retains one pool connection for the full iteration, including HTTP execution. The lease must cover time waiting within a delivery batch as well as the sequential actions for an event.
+HTTP runs without retaining a pool connection, transaction, or row lock. The worker returns its connection after preparation and reacquires one for the result batch. If acquisition or a result write fails, the event remains recoverable after lease expiry. The lease must cover time waiting within a delivery batch as well as the sequential actions for an event.
 
 ## Inspecting deliveries
 

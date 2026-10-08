@@ -124,8 +124,10 @@ success) ; (3) **livraison HTTP hors-tx en parallèle** via
 `futures_util::stream::buffer_unordered(WEBHOOK_DELIVERY_CONCURRENCY)`, aucune connexion
 tenue, actions d'une même ligne séquentielles ; (4) **marks en statements courts autocommit**
 (`mark_outbox_*` ; une erreur de mark est loggée et ignorée — ne rollback plus les marks déjà
-posés ; le bail relivre). Signature de `run_delivery_once(evaluator, conn, cfg)` inchangée
-(pilotage déterministe des tests). 2 nouveaux env : `WEBHOOK_DELIVERY_LEASE_SECS` (210,
+posés ; le bail relivre). Depuis le correctif du 2026-10-08, la signature est
+`run_delivery_once(evaluator, pool, cfg)` : la connexion est effectivement rendue
+avant HTTP, puis reprise une fois pour les résultats du lot. Le pilotage des tests
+reste déterministe. 2 nouveaux env : `WEBHOOK_DELIVERY_LEASE_SECS` (210,
 >= 1), `WEBHOOK_DELIVERY_CONCURRENCY` (10, >= 1). 4 nouveaux tests d'intégration dans
 `tests/integration/test_delivery_lease.rs` (anti double-claim, expiration du bail,
 parallélisme wall-clock, indépendance des marks). 180 tests d'intégration verts.

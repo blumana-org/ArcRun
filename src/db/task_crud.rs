@@ -481,6 +481,8 @@ async fn find_archived_task_by_id<'a>(
 
 /// Atomically claim a Pending task by transitioning it to Claimed.
 /// Returns true if this caller successfully claimed the task, false if another worker got it first.
+/// This status-only primitive does not evaluate rules. Scheduler admission uses
+/// `batch_claim_tasks` or `claim_task_with_rules` instead.
 pub async fn claim_task<'a>(conn: &mut Conn<'a>, task_id: &uuid::Uuid) -> Result<bool, DbError> {
     use crate::schema::task::dsl::*;
     use diesel::dsl::now;
@@ -495,12 +497,14 @@ pub async fn claim_task<'a>(conn: &mut Conn<'a>, task_id: &uuid::Uuid) -> Result
 }
 
 /// Atomically claim a contiguous run of rule-free Pending tasks in a single
-/// `UPDATE ... WHERE id = ANY($ids) AND status='pending' RETURNING id`.
+/// `UPDATE ... WHERE id = ANY($ids) AND status='pending'
+/// AND start_condition='[]'::jsonb RETURNING id`.
 ///
 /// Only valid for tasks with an empty `start_condition` (no concurrency/capacity
 /// rules), because a single UPDATE cannot evaluate per-task rules. Returns the set
 /// of IDs that were actually transitioned Pending -> Claimed (some may already have
-/// been claimed by another worker, in which case they are absent from the result).
+/// been claimed or received rules since the scan, in which case they are absent
+/// from the result and can be reevaluated by a later scheduler iteration).
 pub async fn batch_claim_tasks<'a>(
     conn: &mut Conn<'a>,
     ids: &[uuid::Uuid],
@@ -512,12 +516,17 @@ pub async fn batch_claim_tasks<'a>(
         return Ok(vec![]);
     }
 
-    let claimed_ids =
-        diesel::update(task.filter(id.eq_any(ids).and(status.eq(StatusKind::Pending))))
-            .set((status.eq(StatusKind::Claimed), last_updated.eq(now)))
-            .returning(id)
-            .get_results::<uuid::Uuid>(conn)
-            .await?;
+    let claimed_ids = diesel::update(
+        task.filter(
+            id.eq_any(ids)
+                .and(status.eq(StatusKind::Pending))
+                .and(start_condition.eq(rule::Rules::default())),
+        ),
+    )
+    .set((status.eq(StatusKind::Claimed), last_updated.eq(now)))
+    .returning(id)
+    .get_results::<uuid::Uuid>(conn)
+    .await?;
 
     Ok(claimed_ids)
 }
@@ -551,7 +560,8 @@ pub enum ClaimResult {
     Claimed,
     /// A concurrency rule blocked this task from being claimed.
     RuleBlocked,
-    /// Task was already claimed by another worker (UPDATE touched 0 rows).
+    /// The snapshot is no longer claimable: its status or rules changed
+    /// (the guarded UPDATE touched 0 rows). A later scan can retry a Pending task.
     AlreadyClaimed,
 }
 
@@ -582,8 +592,7 @@ pub(crate) use rule::capacity_slot_key;
 pub(crate) use rule::concurrency_slot_key;
 
 /// Pre-computed parameters for the rule-check-and-claim transaction.
-/// Built from a task's rules and metadata before entering the transaction,
-/// so no references to the Task are needed inside the closure.
+/// Slot keys and charge are computed from the snapshot before entering the transaction.
 struct RuleQueryParams {
     /// Unified slot list (Audit 2, D1 / 7.3b): `(canonical_key, increment, threshold)`,
     /// covering **both** Concurrency (`conc:` key, increment `1`, threshold
@@ -765,8 +774,10 @@ impl From<DbError> for ClaimTxAbort {
 /// fresh-INSERT / `used < threshold` gate matches the old `sum >= max_cap` probe;
 /// overshoot when a large candidate lands on a near-full slot is allowed, as before).
 ///
-/// The final claim `UPDATE ... WHERE id = $ AND status = 'pending'` matching 0 rows
-/// (task already claimed) also rolls back ⇒ `AlreadyClaimed` (no slot consumed).
+/// The final claim UPDATE also compares the current rules with the evaluated
+/// snapshot. A concurrent batch-rules edit or status change makes it match 0 rows
+/// and rolls back ⇒ `AlreadyClaimed` (no slot consumed). No extra query or lock is
+/// needed; a later scan evaluates the updated rules.
 pub async fn claim_task_with_rules<'a>(
     conn: &mut Conn<'a>,
     t: &Task,
@@ -782,23 +793,25 @@ pub(crate) async fn claim_task_with_rules_detailed<'a>(
     conn: &mut Conn<'a>,
     t: &Task,
 ) -> Result<RuleClaimOutcome, DbError> {
-    // No rules — just do a plain claim (no slot needed). A rule-less task never held a
-    // capacity charge (start_condition is immutable), so capacity_charge stays NULL.
+    // Reuse the guarded rule-free path: a batch-rules PATCH may have added rules
+    // since this snapshot was read. No slots are consumed by this path.
     if t.start_condition.0.is_empty() {
-        return Ok(match claim_task(conn, &t.id).await? {
-            true => RuleClaimOutcome {
-                result: ClaimResult::Claimed,
-                blocked_concurrency: None,
+        let claimed = !batch_claim_tasks(conn, std::slice::from_ref(&t.id))
+            .await?
+            .is_empty();
+        return Ok(RuleClaimOutcome {
+            result: if claimed {
+                ClaimResult::Claimed
+            } else {
+                ClaimResult::AlreadyClaimed
             },
-            false => RuleClaimOutcome {
-                result: ClaimResult::AlreadyClaimed,
-                blocked_concurrency: None,
-            },
+            blocked_concurrency: None,
         });
     }
 
     // Pre-compute everything we need before entering the transaction closure.
     let task_id = t.id;
+    let expected_rules = &t.start_condition;
     let params = match RuleQueryParams::from_task(t) {
         Ok(p) => p,
         Err(result) => {
@@ -858,11 +871,12 @@ pub(crate) async fn claim_task_with_rules_detailed<'a>(
                 "UPDATE task
                  SET status = 'claimed', last_updated = now(),
                      claimed_slot_keys = $2, capacity_charge = $3
-                 WHERE id = $1 AND status = 'pending'",
+                 WHERE id = $1 AND status = 'pending' AND start_condition = $4",
             )
             .bind::<diesel::sql_types::Uuid, _>(task_id)
             .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&keys)
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(capacity_charge)
+            .bind::<diesel::sql_types::Jsonb, _>(expected_rules)
             .execute(&mut *conn)
             .await?;
             if claimed_rows == 0 {

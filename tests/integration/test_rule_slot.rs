@@ -484,26 +484,26 @@ async fn test_slot_released_on_stop_batch() {
 async fn test_slot_no_leak_after_metadata_mutation() {
     let (_g, state) = setup_test_app().await;
     let app = test_service!(state);
-    let created = create_tasks_ok(
-        &app,
-        &[task_json_with_rules(
-            "mm1",
-            "slot-meta",
-            json!({"projectId": 1}),
-            1,
-        )],
-    )
-    .await;
-    let id = created[0].id;
     let rule = conc_rule("slot-meta", 1, &["projectId"]);
+    let mut payload = task_json_with_rules("mm1", "slot-meta", json!({"projectId": 1}), 1);
+    // Persist the same metadata matcher that admission evaluates. A snapshot
+    // with different rules is now correctly rejected as stale.
+    payload["rules"] = json!(rules_of(&rule));
+    let created = create_tasks_ok(&app, &[payload]).await;
+    let id = created[0].id;
     let key = slot_key(&rule, &json!({"projectId": 1}));
 
     let mut conn = state.pool.get().await.unwrap();
     let t = task_for_claim(id, "slot-meta", json!({"projectId": 1}), rules_of(&rule));
-    claim_task_with_rules(&mut conn, &t).await.unwrap();
-    arcrun::db_operation::mark_task_running(&mut conn, &id)
-        .await
-        .unwrap();
+    assert_eq!(
+        claim_task_with_rules(&mut conn, &t).await.unwrap(),
+        ClaimResult::Claimed
+    );
+    assert!(
+        arcrun::db_operation::mark_task_running(&mut conn, &id)
+            .await
+            .unwrap()
+    );
     assert_eq!(slot_used(&state.pool, &key).await, Some(1));
 
     // Full-replace the metadata (counter-only PATCH, no status change).
