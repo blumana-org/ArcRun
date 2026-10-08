@@ -1,3 +1,7 @@
+// Diesel QueryableByName emits separate impls with explicit field initializers;
+// an allow on the struct does not cover those generated impls.
+#![allow(clippy::redundant_field_names)]
+
 //! Lot 2 follow-up — lease-based claim + parallel out-of-transaction delivery.
 //!
 //! `run_delivery_once` now claims mature outbox rows in a short transaction (pushing

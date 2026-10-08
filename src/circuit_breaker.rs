@@ -297,8 +297,8 @@ impl CircuitBreaker {
                     }
                 }
             }
-            STATE_HALF_OPEN => {
-                // Probe failed, back to open
+            // Probe failed, back to open.
+            STATE_HALF_OPEN
                 if self
                     .state
                     .compare_exchange(
@@ -307,15 +307,14 @@ impl CircuitBreaker {
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     )
-                    .is_ok()
-                {
-                    log::warn!("Circuit breaker probe failed, returning to Open state");
-                    self.opened_at.store(now, Ordering::Relaxed);
-                    crate::metrics::record_circuit_breaker_state("open");
-                }
+                    .is_ok() =>
+            {
+                log::warn!("Circuit breaker probe failed, returning to Open state");
+                self.opened_at.store(now, Ordering::Relaxed);
+                crate::metrics::record_circuit_breaker_state("open");
             }
             _ => {
-                // Already open, nothing to do
+                // Already open, or another probe already returned it to Open.
             }
         }
     }

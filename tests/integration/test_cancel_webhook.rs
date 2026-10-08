@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Priority 1 — Cancel webhook flow end-to-end
 /// Tests that on_start can return a cancel action, and canceling the task fires the cancel webhook.
-
+///
 /// Test canceling a Running task (DELETE /task/{id} on Running).
 /// The cancel webhook should fire and children should be propagated.
 #[tokio::test]

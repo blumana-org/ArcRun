@@ -1,3 +1,7 @@
+// Diesel QueryableByName emits separate impls with explicit field initializers;
+// an allow on the struct does not cover those generated impls.
+#![allow(clippy::redundant_field_names)]
+
 //! Lot 2 — transactional webhook outbox tests.
 //!
 //! End/cancel webhooks are enqueued into the dedicated `webhook_outbox` queue (Audit 2
@@ -540,7 +544,7 @@ async fn test_patch_fast_even_when_downstream_slow() {
     let start = std::time::Instant::now();
     let req = actix_web::test::TestRequest::patch()
         .uri(&format!("/task/{}", task_id))
-        .set_json(&json!({"status": "Success"}))
+        .set_json(json!({"status": "Success"}))
         .to_request();
     let resp = actix_web::test::call_service(&app, req).await;
     let elapsed = start.elapsed();

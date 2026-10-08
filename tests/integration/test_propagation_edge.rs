@@ -3,7 +3,7 @@ use crate::common::*;
 use arcrun::models::StatusKind;
 
 /// Priority 4 — Propagation edge cases.
-
+///
 /// Test: Canceled parent with requires_success=false child.
 /// Child should transition to Pending (not fail) because it doesn't require success.
 #[tokio::test]

@@ -1,3 +1,7 @@
+// Diesel QueryableByName emits separate impls with explicit field initializers;
+// an allow on the struct does not cover those generated impls.
+#![allow(clippy::redundant_field_names)]
+
 //! Webhook delivery loop (Lot 2 — transactional outbox).
 //!
 //! The 5th background worker. End/cancel webhooks are no longer fired inline in the

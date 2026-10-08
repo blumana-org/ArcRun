@@ -1,3 +1,7 @@
+// Diesel QueryableByName emits separate impls with explicit field initializers;
+// an allow on the struct does not cover those generated impls.
+#![allow(clippy::redundant_field_names)]
+
 use crate::Conn;
 use crate::models::{TriggerCondition, TriggerKind, WebhookExecutionStatus};
 use diesel::ExpressionMethods;
@@ -14,6 +18,7 @@ use super::DbError;
 /// - If a row exists with `status = 'success'`: no update → returns `Ok(false)` (skip)
 /// - If a row exists with `status = 'failure'`: resets to pending → returns `Ok(true)` (retry)
 /// - If a row exists with `status = 'pending'`: retries only when `stale_after` elapsed
+///
 /// Note: for Start/Cancel triggers, `condition` is stored as `Success` sentinel.
 pub async fn try_claim_webhook_execution<'a>(
     conn: &mut Conn<'a>,

@@ -57,7 +57,7 @@ async fn test_batch_update_increments_counters() {
     // Send batch update via PUT endpoint
     let update_req = actix_web::test::TestRequest::put()
         .uri(&format!("/task/{}", task_id))
-        .set_json(&json!({"new_success": 5, "new_failures": 2}))
+        .set_json(json!({"new_success": 5, "new_failures": 2}))
         .to_request();
     let update_resp = actix_web::test::call_service(&app, update_req).await;
     assert_eq!(
@@ -85,7 +85,7 @@ async fn test_batch_update_accumulates_multiple_updates() {
     for _ in 0..10 {
         let update_req = actix_web::test::TestRequest::put()
             .uri(&format!("/task/{}", task_id))
-            .set_json(&json!({"new_success": 1, "new_failures": 0}))
+            .set_json(json!({"new_success": 1, "new_failures": 0}))
             .to_request();
         actix_web::test::call_service(&app, update_req).await;
     }
@@ -106,7 +106,7 @@ async fn test_batch_update_rejects_zero_counters() {
     // Try to send update with zero counters
     let update_req = actix_web::test::TestRequest::put()
         .uri(&format!("/task/{}", task_id))
-        .set_json(&json!({"new_success": 0, "new_failures": 0}))
+        .set_json(json!({"new_success": 0, "new_failures": 0}))
         .to_request();
     let update_resp = actix_web::test::call_service(&app, update_req).await;
 
@@ -149,7 +149,7 @@ async fn test_batch_update_dropped_on_terminal_tasks() {
 
     let update_req = actix_web::test::TestRequest::put()
         .uri(&format!("/task/{}", task_id))
-        .set_json(&json!({"new_success": 3, "new_failures": 1}))
+        .set_json(json!({"new_success": 3, "new_failures": 1}))
         .to_request();
     let update_resp = actix_web::test::call_service(&app, update_req).await;
     assert_eq!(
@@ -187,7 +187,7 @@ async fn test_batch_update_dropped_on_terminal_tasks() {
 
     let update_req = actix_web::test::TestRequest::put()
         .uri(&format!("/task/{}", cancel_id))
-        .set_json(&json!({"new_success": 2, "new_failures": 2}))
+        .set_json(json!({"new_success": 2, "new_failures": 2}))
         .to_request();
     let update_resp = actix_web::test::call_service(&app, update_req).await;
     assert_eq!(

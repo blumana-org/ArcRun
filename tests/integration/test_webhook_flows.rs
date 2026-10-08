@@ -9,7 +9,7 @@ use std::sync::{
 
 /// Priority 2 — Webhook flow integration tests.
 /// Tests on_success, on_failure (via PATCH), and start_loop E2E.
-
+///
 /// Test on_success webhook fires when task completes successfully.
 #[tokio::test]
 async fn test_on_success_webhook_fires() {
@@ -199,7 +199,7 @@ async fn test_metadata_only_update() {
     // Update only metadata (no status)
     let update_req = actix_web::test::TestRequest::patch()
         .uri(&format!("/task/{}", task_id))
-        .set_json(&json!({
+        .set_json(json!({
             "metadata": {"new_key": "new_value", "test": true}
         }))
         .to_request();

@@ -1,3 +1,7 @@
+// Diesel QueryableByName emits separate impls with explicit field initializers;
+// an allow on the struct does not cover those generated impls.
+#![allow(clippy::redundant_field_names)]
+
 //! The dedicated webhook delivery QUEUE (`webhook_outbox`, Audit 2 D3).
 //!
 //! This is the at-least-once queue of end/cancel/batch_complete notifications: rows are

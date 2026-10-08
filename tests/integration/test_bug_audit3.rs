@@ -1,3 +1,7 @@
+// Diesel QueryableByName emits separate impls with explicit field initializers;
+// an allow on the struct does not cover those generated impls.
+#![allow(clippy::redundant_field_names)]
+
 //! Audit 2, A1 — `run_in_transaction` cancel-safety regression tests.
 //!
 //! # Original bug
@@ -1160,7 +1164,7 @@ async fn put_counts(
 ) {
     let req = actix_web::test::TestRequest::put()
         .uri(&format!("/task/{}", task_id))
-        .set_json(&json!({"new_success": success, "new_failures": failures}))
+        .set_json(json!({"new_success": success, "new_failures": failures}))
         .to_request();
     let resp = actix_web::test::call_service(app, req).await;
     assert_eq!(
@@ -4055,7 +4059,7 @@ async fn test_audit2_b4_patch_nudges_delivery_loop() {
     let t0 = std::time::Instant::now();
     let patch = actix_web::test::TestRequest::patch()
         .uri(&format!("/task/{}", task_id))
-        .set_json(&json!({"status": "Success"}))
+        .set_json(json!({"status": "Success"}))
         .to_request();
     let resp = actix_web::test::call_service(&app, patch).await;
     assert!(resp.status().is_success(), "PATCH Success should succeed");

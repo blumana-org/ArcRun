@@ -1,3 +1,7 @@
+// Diesel QueryableByName emits separate impls with explicit field initializers;
+// an allow on the struct does not cover those generated impls.
+#![allow(clippy::redundant_field_names)]
+
 use crate::{
     Conn, DbPool,
     action::{ActionExecutor, idempotency_key},
@@ -50,6 +54,10 @@ enum StartPhaseA {
 /// leader and runs every tick. Behavior is identical to before the D7 lease was
 /// added — the existing tests drive this directly. Production uses
 /// [`start_loop_leased`] instead.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep the test entry point aligned with the leased worker configuration."
+)]
 pub async fn start_loop(
     evaluator: &ActionExecutor,
     pool: DbPool,
@@ -797,14 +805,14 @@ async fn fail_started_task(
         );
         return;
     };
-    if let Some(key) = complete_start_false {
-        if let Err(e) = db_operation::complete_webhook_execution(&mut conn, key, false).await {
-            log::error!(
-                "Failed to complete webhook execution record for key {}: {}",
-                key,
-                e
-            );
-        }
+    if let Some(key) = complete_start_false
+        && let Err(e) = db_operation::complete_webhook_execution(&mut conn, key, false).await
+    {
+        log::error!(
+            "Failed to complete webhook execution record for key {}: {}",
+            key,
+            e
+        );
     }
     if let Err(e2) =
         db_operation::fail_task_and_propagate(&mut conn, &task.id, reason, dead_end_enabled).await

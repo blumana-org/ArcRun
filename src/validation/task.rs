@@ -65,17 +65,17 @@ pub fn validate_new_task(dto: &NewTaskDto) -> ValidationResult {
 
     // A10: bound the number of dependencies a single task may declare (an unbounded
     // fan-in multiplies out into the grouped `link` INSERT's bind-parameter count).
-    if let Some(ref deps) = dto.dependencies {
-        if deps.len() > limits.max_deps_per_task {
-            errors.push(ValidationError {
-                field: "dependencies".to_string(),
-                message: format!(
-                    "task cannot exceed {} dependencies (received {})",
-                    limits.max_deps_per_task,
-                    deps.len()
-                ),
-            });
-        }
+    if let Some(ref deps) = dto.dependencies
+        && deps.len() > limits.max_deps_per_task
+    {
+        errors.push(ValidationError {
+            field: "dependencies".to_string(),
+            message: format!(
+                "task cannot exceed {} dependencies (received {})",
+                limits.max_deps_per_task,
+                deps.len()
+            ),
+        });
     }
 
     // A10: bound the number of actions per task. `on_start` is always present (1);
@@ -147,23 +147,23 @@ pub fn validate_new_task(dto: &NewTaskDto) -> ValidationResult {
     }
 
     // Validate expected_count
-    if let Some(expected_count) = dto.expected_count {
-        if expected_count < 0 {
-            errors.push(ValidationError {
-                field: "expected_count".to_string(),
-                message: "expected_count cannot be negative".to_string(),
-            });
-        }
+    if let Some(expected_count) = dto.expected_count
+        && expected_count < 0
+    {
+        errors.push(ValidationError {
+            field: "expected_count".to_string(),
+            message: "expected_count cannot be negative".to_string(),
+        });
     }
 
     // Validate priority range
-    if let Some(p) = dto.priority {
-        if p < -1000 || p > 1000 {
-            errors.push(ValidationError {
-                field: "priority".into(),
-                message: "priority must be between -1000 and 1000".into(),
-            });
-        }
+    if let Some(p) = dto.priority
+        && !(-1000..=1000).contains(&p)
+    {
+        errors.push(ValidationError {
+            field: "priority".into(),
+            message: "priority must be between -1000 and 1000".into(),
+        });
     }
 
     // Validate metadata size (prevent extremely large payloads)
@@ -295,23 +295,23 @@ pub fn validate_update_task(dto: &UpdateTaskDto) -> ValidationResult {
     }
 
     // Validate expected_count
-    if let Some(expected_count) = dto.expected_count {
-        if expected_count < 0 {
-            errors.push(ValidationError {
-                field: "expected_count".to_string(),
-                message: "expected_count cannot be negative".to_string(),
-            });
-        }
+    if let Some(expected_count) = dto.expected_count
+        && expected_count < 0
+    {
+        errors.push(ValidationError {
+            field: "expected_count".to_string(),
+            message: "expected_count cannot be negative".to_string(),
+        });
     }
 
     // Validate priority range
-    if let Some(p) = dto.priority {
-        if p < -1000 || p > 1000 {
-            errors.push(ValidationError {
-                field: "priority".into(),
-                message: "priority must be between -1000 and 1000".into(),
-            });
-        }
+    if let Some(p) = dto.priority
+        && !(-1000..=1000).contains(&p)
+    {
+        errors.push(ValidationError {
+            field: "priority".into(),
+            message: "priority must be between -1000 and 1000".into(),
+        });
     }
 
     // Validate failure_reason is provided when status is Failure

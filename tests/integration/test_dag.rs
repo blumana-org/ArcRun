@@ -103,8 +103,8 @@ async fn test_fan_out_dag() {
     let body = create_tasks_ok(&app, &tasks).await;
     assert_eq!(body.len(), 5);
     assert_eq!(body[0].status, StatusKind::Pending);
-    for i in 1..5 {
-        assert_eq!(body[i].status, StatusKind::Waiting);
+    for task in &body[1..5] {
+        assert_eq!(task.status, StatusKind::Waiting);
     }
 }
 
@@ -134,8 +134,8 @@ async fn test_fan_in_dag() {
 
     let body = create_tasks_ok(&app, &tasks).await;
     assert_eq!(body.len(), 5);
-    for i in 0..4 {
-        assert_eq!(body[i].status, StatusKind::Pending);
+    for task in &body[..4] {
+        assert_eq!(task.status, StatusKind::Pending);
     }
     assert_eq!(body[4].status, StatusKind::Waiting);
 }

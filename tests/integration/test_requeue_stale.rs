@@ -4,7 +4,7 @@ use arcrun::models::StatusKind;
 
 /// Priority 1 — Requeue of stale Claimed tasks (timeout loop).
 /// Simulates worker crash leaving tasks stuck in Claimed state.
-
+///
 /// Test that a Claimed task older than the threshold is requeued to Pending.
 #[tokio::test]
 async fn test_stale_claimed_task_requeued_to_pending() {

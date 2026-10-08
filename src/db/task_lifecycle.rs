@@ -88,54 +88,48 @@ pub async fn update_running_task<'a>(
 
                 let mut cascade = Vec::new();
                 let mut ancestors = Vec::new();
-                if res == 1 {
-                    if let Some(ref final_status) = dto.status {
-                        cascade =
-                            workers::propagate_to_children(&task_id, final_status, conn).await?;
+                if res == 1
+                    && let Some(ref final_status) = dto.status
+                {
+                    cascade = workers::propagate_to_children(&task_id, final_status, conn).await?;
 
-                        // Dead-end ancestor cancellation
-                        if dead_end_enabled {
-                            let mut terminal_ids = vec![task_id];
-                            terminal_ids.extend_from_slice(&cascade);
-                            ancestors =
-                                workers::cancel_dead_end_ancestors(&terminal_ids, conn).await?;
-                        }
-
-                        // Enqueue outbox rows for end + cascade + dead-end ancestors
-                        // (inside the tx, no reqwest in the call path).
-                        workers::enqueue_end_outbox_with_cascade(
-                            &task_id,
-                            (*final_status).try_into()?,
-                            &cascade,
-                            conn,
-                        )
-                        .await?;
-                        workers::enqueue_outbox_for_canceled_ancestors(&ancestors, conn).await?;
-
-                        // Batch-complete detection (D2): every task terminalized in this
-                        // tx — the PATCHed task (Success/Failure, guaranteed terminal by
-                        // `validate_update_task`), its cascade-failed children, and any
-                        // dead-end-canceled ancestors — decrements `batch.remaining`. A
-                        // batch that reaches 0 (with a registered webhook) enqueues the
-                        // batch_complete row in this same tx.
+                    // Dead-end ancestor cancellation
+                    if dead_end_enabled {
                         let mut terminal_ids = vec![task_id];
                         terminal_ids.extend_from_slice(&cascade);
-                        terminal_ids.extend(ancestors.iter().map(|a| a.id));
-                        decrement_batch_remaining_for_tasks(
-                            conn,
-                            &terminal_ids,
-                            "update_running_task",
-                        )
+                        ancestors = workers::cancel_dead_end_ancestors(&terminal_ids, conn).await?;
+                    }
+
+                    // Enqueue outbox rows for end + cascade + dead-end ancestors
+                    // (inside the tx, no reqwest in the call path).
+                    workers::enqueue_end_outbox_with_cascade(
+                        &task_id,
+                        (*final_status).try_into()?,
+                        &cascade,
+                        conn,
+                    )
+                    .await?;
+                    workers::enqueue_outbox_for_canceled_ancestors(&ancestors, conn).await?;
+
+                    // Batch-complete detection (D2): every task terminalized in this
+                    // tx — the PATCHed task (Success/Failure, guaranteed terminal by
+                    // `validate_update_task`), its cascade-failed children, and any
+                    // dead-end-canceled ancestors — decrements `batch.remaining`. A
+                    // batch that reaches 0 (with a registered webhook) enqueues the
+                    // batch_complete row in this same tx.
+                    let mut terminal_ids = vec![task_id];
+                    terminal_ids.extend_from_slice(&cascade);
+                    terminal_ids.extend(ancestors.iter().map(|a| a.id));
+                    decrement_batch_remaining_for_tasks(conn, &terminal_ids, "update_running_task")
                         .await?;
 
-                        // Slot release (Audit 2, D1): the PATCHed task was Running/Claimed
-                        // (held its slots); dead-end-canceled ancestors that were
-                        // Running/Claimed held theirs too. Cascade-failed children were
-                        // Waiting/Paused (never claimed ⇒ NULL keys ⇒ no-op). The
-                        // `claimed_slot_keys IS NOT NULL` gate releases only real holders,
-                        // so passing the whole terminal set is correct.
-                        release_slots_for_tasks(conn, &terminal_ids).await?;
-                    }
+                    // Slot release (Audit 2, D1): the PATCHed task was Running/Claimed
+                    // (held its slots); dead-end-canceled ancestors that were
+                    // Running/Claimed held theirs too. Cascade-failed children were
+                    // Waiting/Paused (never claimed ⇒ NULL keys ⇒ no-op). The
+                    // `claimed_slot_keys IS NOT NULL` gate releases only real holders,
+                    // so passing the whole terminal set is correct.
+                    release_slots_for_tasks(conn, &terminal_ids).await?;
                 }
 
                 Ok((res, cascade, ancestors))

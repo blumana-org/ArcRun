@@ -1,3 +1,7 @@
+// Diesel QueryableByName emits separate impls with explicit field initializers;
+// an allow on the struct does not cover those generated impls.
+#![allow(clippy::redundant_field_names)]
+
 //! Integration tests for the D6 (7.5b) task archive.
 //!
 //! The retention loop no longer DELETEs old terminal tasks — it MOVES them into the cold

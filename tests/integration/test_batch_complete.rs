@@ -1,3 +1,7 @@
+// Diesel QueryableByName emits separate impls with explicit field initializers;
+// an allow on the struct does not cover those generated impls.
+#![allow(clippy::redundant_field_names)]
+
 //! Lot 3 — grouped batch insertion (3a) + `on_batch_complete` webhook (3b).
 //!
 //! 3a tests assert the grouped multi-row INSERT path produces exactly the same

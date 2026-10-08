@@ -1,3 +1,7 @@
+// Diesel QueryableByName emits separate impls with explicit field initializers;
+// an allow on the struct does not cover those generated impls.
+#![allow(clippy::redundant_field_names)]
+
 use chrono::Utc;
 // use crate::actions::ActionKindEnum;
 use diesel::prelude::*;

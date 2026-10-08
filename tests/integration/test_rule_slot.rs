@@ -1,3 +1,7 @@
+// Diesel QueryableByName emits separate impls with explicit field initializers;
+// an allow on the struct does not cover those generated impls.
+#![allow(clippy::redundant_field_names)]
+
 //! Audit 2, D1/D7 (7.3a) — DB-enforced Concurrency via `rule_slot` counters + the
 //! start_loop leader lease.
 //!

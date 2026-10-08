@@ -3,7 +3,7 @@ use crate::common::*;
 use arcrun::models::StatusKind;
 
 /// Priority 3 — End-to-end validation tests via HTTP API.
-
+///
 /// Test POST /task with empty array returns appropriate response.
 #[tokio::test]
 async fn test_create_task_empty_array() {

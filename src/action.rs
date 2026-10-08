@@ -287,7 +287,7 @@ impl ActionExecutor {
                     TriggerKind::BatchComplete => "batch_complete",
                 };
                 // Task-level webhooks carry a `?handle=` callback URL and X-Task-* headers.
-                let handle = format!("{}/task/{}", &self.ctx.host_address, &task.id);
+                let handle = format!("{}/task/{}", self.ctx.host_address, task.id);
                 let body = merge_enrichment(
                     params.body.clone(),
                     enrichment.map(serde_json::to_value).and_then(Result::ok),

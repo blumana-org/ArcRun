@@ -1,3 +1,7 @@
+// Diesel QueryableByName emits separate impls with explicit field initializers;
+// an allow on the struct does not cover those generated impls.
+#![allow(clippy::redundant_field_names)]
+
 use crate::common::*;
 
 use arcrun::models::StatusKind;
@@ -216,7 +220,7 @@ async fn test_bug3_double_update_via_api_second_call_idempotent() {
     // First PATCH: Success
     let patch1 = actix_web::test::TestRequest::patch()
         .uri(&format!("/task/{}", task_id))
-        .set_json(&json!({"status": "Success"}))
+        .set_json(json!({"status": "Success"}))
         .to_request();
     let resp1 = actix_web::test::call_service(&app, patch1).await;
     assert_eq!(
@@ -228,7 +232,7 @@ async fn test_bug3_double_update_via_api_second_call_idempotent() {
     // Second PATCH with the SAME status: idempotent no-op → 200 (A10).
     let patch2 = actix_web::test::TestRequest::patch()
         .uri(&format!("/task/{}", task_id))
-        .set_json(&json!({"status": "Success"}))
+        .set_json(json!({"status": "Success"}))
         .to_request();
     let resp2 = actix_web::test::call_service(&app, patch2).await;
     assert_eq!(
@@ -289,7 +293,7 @@ async fn test_bug4_update_rejects_invalid_status_transitions() {
     for invalid_status in &["Running", "Pending", "Waiting"] {
         let req = actix_web::test::TestRequest::patch()
             .uri(&format!("/task/{}", task_id))
-            .set_json(&json!({"status": invalid_status}))
+            .set_json(json!({"status": invalid_status}))
             .to_request();
         let resp = actix_web::test::call_service(&app, req).await;
         assert_eq!(
@@ -329,7 +333,7 @@ async fn test_bug4_failure_requires_reason() {
 
     let req_no_reason = actix_web::test::TestRequest::patch()
         .uri(&format!("/task/{}", task_id))
-        .set_json(&json!({"status": "Failure"}))
+        .set_json(json!({"status": "Failure"}))
         .to_request();
     let resp_no_reason = actix_web::test::call_service(&app, req_no_reason).await;
     assert_eq!(
@@ -374,7 +378,7 @@ async fn test_bug4_rejects_negative_counters() {
     // Negative new_success
     let req_neg_success = actix_web::test::TestRequest::patch()
         .uri(&format!("/task/{}", task_id))
-        .set_json(&json!({"new_success": -5}))
+        .set_json(json!({"new_success": -5}))
         .to_request();
     let resp_neg_success = actix_web::test::call_service(&app, req_neg_success).await;
     assert_eq!(
@@ -386,7 +390,7 @@ async fn test_bug4_rejects_negative_counters() {
     // Negative new_failures
     let req_neg_failures = actix_web::test::TestRequest::patch()
         .uri(&format!("/task/{}", task_id))
-        .set_json(&json!({"new_failures": -3}))
+        .set_json(json!({"new_failures": -3}))
         .to_request();
     let resp_neg_failures = actix_web::test::call_service(&app, req_neg_failures).await;
     assert_eq!(
@@ -406,7 +410,7 @@ async fn test_bug8_update_nonexistent_task_returns_404() {
     let fake_id = uuid::Uuid::new_v4();
     let update_req = actix_web::test::TestRequest::patch()
         .uri(&format!("/task/{}", fake_id))
-        .set_json(&json!({"status": "Success"}))
+        .set_json(json!({"status": "Success"}))
         .to_request();
     let update_resp = actix_web::test::call_service(&app, update_req).await;
 
@@ -431,7 +435,7 @@ async fn test_bug8_update_non_running_task_returns_409() {
     // Attempt to update a Pending task — the task exists but is not Running, so 409.
     let update_req = actix_web::test::TestRequest::patch()
         .uri(&format!("/task/{}", task_id))
-        .set_json(&json!({"status": "Success"}))
+        .set_json(json!({"status": "Success"}))
         .to_request();
     let update_resp = actix_web::test::call_service(&app, update_req).await;
 

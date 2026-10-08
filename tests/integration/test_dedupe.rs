@@ -37,7 +37,7 @@ async fn test_dedupe_skip_existing() {
     let create_req2 = actix_web::test::TestRequest::post()
         .uri("/task")
         .insert_header(("requester", "test"))
-        .set_json(&vec![task2])
+        .set_json(vec![task2])
         .to_request();
     let create_resp2 = actix_web::test::call_service(&app, create_req2).await;
     // Should return NoContent because task was deduplicated
@@ -82,7 +82,7 @@ async fn test_bug7_dedupe_not_over_aggressive_when_metadata_is_none() {
     let create_req2 = actix_web::test::TestRequest::post()
         .uri("/task")
         .insert_header(("requester", "test"))
-        .set_json(&vec![task2])
+        .set_json(vec![task2])
         .to_request();
     let create_resp2 = actix_web::test::call_service(&app, create_req2).await;
     assert_eq!(
@@ -139,7 +139,7 @@ async fn test_dedupe_against_running_task() {
     let req = actix_web::test::TestRequest::post()
         .uri("/task")
         .insert_header(("requester", "test"))
-        .set_json(&vec![task2])
+        .set_json(vec![task2])
         .to_request();
     let resp = actix_web::test::call_service(&app, req).await;
     assert_eq!(
@@ -194,7 +194,7 @@ async fn test_dedupe_pending_does_not_match_running() {
     let req = actix_web::test::TestRequest::post()
         .uri("/task")
         .insert_header(("requester", "test"))
-        .set_json(&vec![task2])
+        .set_json(vec![task2])
         .to_request();
     let resp = actix_web::test::call_service(&app, req).await;
     assert_eq!(
@@ -238,7 +238,7 @@ async fn test_bug7_dedupe_two_tasks_both_no_metadata() {
     let create_req2 = actix_web::test::TestRequest::post()
         .uri("/task")
         .insert_header(("requester", "test"))
-        .set_json(&vec![task2])
+        .set_json(vec![task2])
         .to_request();
     let create_resp2 = actix_web::test::call_service(&app, create_req2).await;
     assert_eq!(

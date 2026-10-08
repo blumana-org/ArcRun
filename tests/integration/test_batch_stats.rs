@@ -4,7 +4,7 @@ use arcrun::dtos::{BatchStatsDto, BatchSummaryDto};
 use serde_json::json;
 
 /// Priority 2 — GET /batch/{batch_id} (batch stats) and GET /batches (batch listing).
-
+///
 /// Test correct aggregation of success/failure counters across tasks.
 #[tokio::test]
 async fn test_batch_stats_aggregation() {

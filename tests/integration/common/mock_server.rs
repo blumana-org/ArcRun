@@ -267,10 +267,7 @@ pub fn spawn_header_capture_server() -> (
                             let mut data = Vec::new();
                             let mut buf = [0u8; 4096];
                             loop {
-                                let read = match stream.read(&mut buf).await {
-                                    Ok(n) => n,
-                                    Err(_) => 0,
-                                };
+                                let read = stream.read(&mut buf).await.unwrap_or_default();
                                 if read == 0 {
                                     break;
                                 }

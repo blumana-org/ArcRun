@@ -84,7 +84,7 @@ pub async fn timeout_loop(
                     "Timeout worker: {} tasks timed out (pass {}), {:?}",
                     batch_len,
                     pass,
-                    &timed_out_ids
+                    timed_out_ids
                 );
 
                 // Step 2: for each, atomically mark failed + propagate (in tx).

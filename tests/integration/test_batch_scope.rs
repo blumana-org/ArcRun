@@ -1,3 +1,7 @@
+// Diesel QueryableByName emits separate impls with explicit field initializers;
+// an allow on the struct does not cover those generated impls.
+#![allow(clippy::redundant_field_names)]
+
 //! Tasker #601 — batch scope / metadata.
 //!
 //! A `POST /task` object body may carry a `scope` (text label) and/or `metadata`

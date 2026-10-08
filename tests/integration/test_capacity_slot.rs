@@ -1,3 +1,7 @@
+// Diesel QueryableByName emits separate impls with explicit field initializers;
+// an allow on the struct does not cover those generated impls.
+#![allow(clippy::redundant_field_names)]
+
 //! Audit 2, D1 (7.3b) — DB-enforced **Capacity** via `rule_slot` charge counters.
 //!
 //! Capacity rules are now enforced by charging a per-rule `rule_slot.used` at claim time

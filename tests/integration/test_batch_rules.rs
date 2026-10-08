@@ -213,7 +213,7 @@ async fn test_update_batch_rules_skips_claimed_tasks() {
 
     let req = actix_web::test::TestRequest::patch()
         .uri(&format!("/batch/{}/rules", batch_id))
-        .set_json(&json!({
+        .set_json(json!({
             "kind": "rule-active",
             "rules": [{
                 "type": "Concurency",
@@ -269,7 +269,7 @@ async fn test_update_batch_rules_with_empty_removes_rules() {
     // Clear rules for kind "clear-rules"
     let req = actix_web::test::TestRequest::patch()
         .uri(&format!("/batch/{}/rules", batch_id))
-        .set_json(&json!({ "kind": "clear-rules", "rules": [] }))
+        .set_json(json!({ "kind": "clear-rules", "rules": [] }))
         .to_request();
     let resp = actix_web::test::call_service(&app, req).await;
     assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
@@ -290,7 +290,7 @@ async fn test_update_batch_rules_not_found() {
     let fake_batch_id = uuid::Uuid::new_v4();
     let req = actix_web::test::TestRequest::patch()
         .uri(&format!("/batch/{}/rules", fake_batch_id))
-        .set_json(&json!({ "kind": "anything", "rules": [] }))
+        .set_json(json!({ "kind": "anything", "rules": [] }))
         .to_request();
     let resp = actix_web::test::call_service(&app, req).await;
     assert_eq!(resp.status(), actix_web::http::StatusCode::NOT_FOUND);
@@ -444,7 +444,7 @@ async fn test_update_batch_rules_validation_error() {
     // Invalid: empty kind
     let req = actix_web::test::TestRequest::patch()
         .uri(&format!("/batch/{}/rules", batch_id))
-        .set_json(&json!({ "kind": "", "rules": [] }))
+        .set_json(json!({ "kind": "", "rules": [] }))
         .to_request();
     let resp = actix_web::test::call_service(&app, req).await;
     assert_eq!(resp.status(), actix_web::http::StatusCode::BAD_REQUEST);
@@ -452,7 +452,7 @@ async fn test_update_batch_rules_validation_error() {
     // Invalid: Capacity rule with matcher.status = Pending
     let req = actix_web::test::TestRequest::patch()
         .uri(&format!("/batch/{}/rules", batch_id))
-        .set_json(&json!({
+        .set_json(json!({
             "kind": "validate-rules",
             "rules": [{
                 "type": "Capacity",
@@ -467,7 +467,7 @@ async fn test_update_batch_rules_validation_error() {
     // Invalid: Concurency rule with max_concurency = 0
     let req = actix_web::test::TestRequest::patch()
         .uri(&format!("/batch/{}/rules", batch_id))
-        .set_json(&json!({
+        .set_json(json!({
             "kind": "validate-rules",
             "rules": [{
                 "type": "Concurency",

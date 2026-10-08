@@ -100,7 +100,7 @@ async fn test_priority_update() {
     // PATCH to update priority
     let req = actix_web::test::TestRequest::patch()
         .uri(&format!("/task/{}", task_id))
-        .set_json(&json!({ "priority": 999 }))
+        .set_json(json!({ "priority": 999 }))
         .to_request();
     let resp = actix_web::test::call_service(&app, req).await;
     assert!(resp.status().is_success(), "PATCH should succeed");

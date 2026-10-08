@@ -73,7 +73,7 @@ async fn test_update_task_status_via_api() {
     // Update task to Success via PATCH
     let update_req = actix_web::test::TestRequest::patch()
         .uri(&format!("/task/{}", task_id))
-        .set_json(&json!({"status": "Success"}))
+        .set_json(json!({"status": "Success"}))
         .to_request();
     let update_resp = actix_web::test::call_service(&app, update_req).await;
     assert!(update_resp.status().is_success());
@@ -106,7 +106,7 @@ async fn test_update_task_with_failure_reason() {
     // Update task to Failure with reason
     let update_req = actix_web::test::TestRequest::patch()
         .uri(&format!("/task/{}", task_id))
-        .set_json(&json!({
+        .set_json(json!({
             "status": "Failure",
             "failure_reason": "Connection timeout after 30 seconds"
         }))

@@ -260,7 +260,7 @@ async fn test_bug19_put_ignores_status_validation() {
     // Should succeed because PUT only validates counters, not status
     let put_req = actix_web::test::TestRequest::put()
         .uri(&format!("/task/{}", task_id))
-        .set_json(&json!({"status": "Failure", "new_success": 1}))
+        .set_json(json!({"status": "Failure", "new_success": 1}))
         .to_request();
     let put_resp = actix_web::test::call_service(&app, put_req).await;
 
@@ -298,7 +298,7 @@ async fn test_bug19_patch_still_validates_status() {
     // PATCH with status=Failure and no failure_reason — should be rejected
     let patch_req = actix_web::test::TestRequest::patch()
         .uri(&format!("/task/{}", task_id))
-        .set_json(&json!({"status": "Failure"}))
+        .set_json(json!({"status": "Failure"}))
         .to_request();
     let patch_resp = actix_web::test::call_service(&app, patch_req).await;
 

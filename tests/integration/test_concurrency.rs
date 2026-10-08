@@ -1086,9 +1086,9 @@ async fn test_capacity_combined_with_concurrency() {
     let mut conn = state.pool.get().await.unwrap();
 
     // Claim + run first 3 tasks (each remaining=100, sum=300, count=3)
-    for i in 0..3 {
+    for (i, id) in ids.iter().take(3).enumerate() {
         let t = make_task_for_claim_with_expected(
-            ids[i],
+            *id,
             "cap-combo",
             json!({}),
             combined_rules.clone(),
@@ -1101,7 +1101,7 @@ async fn test_capacity_combined_with_concurrency() {
             "Task {} should be claimed",
             i + 1
         );
-        arcrun::db_operation::mark_task_running(&mut conn, &ids[i])
+        arcrun::db_operation::mark_task_running(&mut conn, id)
             .await
             .unwrap();
     }

@@ -15,12 +15,12 @@ use testcontainers_modules::postgres::Postgres;
 static CONTAINER_ID: Mutex<Option<String>> = Mutex::new(None);
 
 extern "C" fn cleanup_container() {
-    if let Ok(guard) = CONTAINER_ID.lock() {
-        if let Some(id) = guard.as_ref() {
-            let _ = std::process::Command::new("docker")
-                .args(["rm", "-f", id])
-                .output();
-        }
+    if let Ok(guard) = CONTAINER_ID.lock()
+        && let Some(id) = guard.as_ref()
+    {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", id])
+            .output();
     }
 }
 
@@ -289,8 +289,9 @@ fn run_migrations(database_url: &str) {
             for migration in pending_now {
                 if migration.name().to_string() == *migration_name {
                     let _ = diesel::sql_query("COMMIT").execute(&mut conn);
-                    conn.run_migration(&migration)
-                        .expect(&format!("Failed to run migration: {}", migration_name));
+                    conn.run_migration(&migration).unwrap_or_else(|error| {
+                        panic!("Failed to run migration: {}: {:?}", migration_name, error)
+                    });
                     break;
                 }
             }

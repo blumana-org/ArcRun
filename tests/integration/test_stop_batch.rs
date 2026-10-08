@@ -5,7 +5,7 @@ use arcrun::models::StatusKind;
 
 /// Priority 1 — DELETE /batch/{batch_id} (stop_batch)
 /// Production-critical operation for killing runaway batches.
-
+///
 /// Test that stop_batch cancels Waiting, Pending, and Paused tasks.
 #[tokio::test]
 async fn test_stop_batch_cancels_non_terminal_tasks() {

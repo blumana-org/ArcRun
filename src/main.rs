@@ -46,7 +46,7 @@ async fn main() -> std::io::Result<()> {
     let config = Arc::new(load_config());
 
     log::info!("Starting HTTP server at http://0.0.0.0:{}", config.port);
-    log::info!("Using public url {}", &config.host_url);
+    log::info!("Using public url {}", config.host_url);
 
     init_security(&config);
     init_auth(&config);
