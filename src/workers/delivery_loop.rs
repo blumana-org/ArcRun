@@ -12,39 +12,29 @@
 //!
 //! Guarantees (see `docs/perf-correctness-plan.md`, "Contrat API cible"):
 //! - **At-least-once**: a row survives crash/redeploy and is delivered on restart.
-//! - **Per-task order**: an `end`/`cancel` row is only delivered once the task's
-//!   `start` row is no longer `pending` (enforced in `claim_due_outbox_leased`).
+//! - **Start gate**: an `end`/`cancel` row waits while the task's `start` row is
+//!   pending and fresh (enforced in `claim_due_outbox_leased`).
 //! - **Idempotency**: the `Idempotency-Key` header (= `idempotency_key`) lets the
-//!   consumer dedupe; a delivered row is marked `success` and never re-sent.
+//!   consumer dedupe. A successful mark removes the row from the queue; a crash
+//!   before that mark or an expired lease can still cause duplicate HTTP delivery.
 //!
-//! ## Lease-based claim + parallel out-of-tx delivery
+//! ## Bounded admission and streaming acknowledgements
 //!
-//! `run_delivery_once` runs in four phases, NOT one long transaction:
+//! Each short claim transaction leases only as many rows as there are free slots.
+//! Inputs are bulk-prefetched, then HTTP runs without retaining a connection.
+//! Actions within an event remain sequential. Ready results are coalesced and
+//! marked before refilling free slots, without waiting for slower events.
 //!
-//! 1. **Claim (short tx).** Select the mature rows and push their `next_attempt_at`
-//!    a *lease* into the future (`claim_due_outbox_leased`). The lease is a soft lock:
-//!    while it holds, no other worker / iteration re-claims the row; if we crash
-//!    mid-delivery, the lease expires and the row matures again (at-least-once). The
-//!    lease does NOT bump `attempts`.
-//! 2. **Prefetch (autocommit reads).** Load each row's delivery inputs (task + actions,
-//!    or `batch.on_complete` + stats). Terminal states are immutable, so these reads
-//!    are stable. The fast-paths (task/batch gone ⇒ success; malformed batch payload ⇒
-//!    exhausted; zero actions ⇒ success) are resolved here, before any HTTP.
-//! 3. **Deliver (parallel, no DB).** The HTTP executions run concurrently, bounded by
-//!    `concurrency`, via `buffer_unordered`. The connection is returned to the pool
-//!    before HTTP; no connection, transaction, or row lock is held during delivery.
-//!    Actions of a *single* row stay sequential (unchanged behaviour).
-//! 4. **Mark (short autocommit statements).** Each outcome is committed with the
-//!    existing `mark_outbox_*` helpers. A failed mark is logged and skipped — it does
-//!    NOT roll back already-posted marks (the old single-tx design's flaw); the lease
-//!    re-delivers, which is fine under at-least-once.
+//! Every result is fenced by its claim token. A transient DB failure retains the
+//! result for retry and pauses admission; active jobs plus pending results never
+//! exceed `concurrency`. After a process crash the durable leases expire and allow
+//! redelivery. Shutdown drains admitted work; if its marks fail, leases recover it.
 
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use actix_web::rt;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
-use futures_util::stream::{self, StreamExt};
 use tokio::sync::watch;
 
 use crate::{
@@ -63,10 +53,10 @@ pub struct DeliveryConfig {
     pub backoff_base_secs: i64,
     pub backoff_cap_secs: i64,
     /// Lease (seconds) applied to a row at claim time: it stays "in-flight" (not
-    /// re-claimable) until the lease expires. Must cover the wait within the batch
-    /// as well as the worst-case delivery time of an individual row.
+    /// re-claimable) until the lease expires. Must cover preparation, sequential
+    /// actions for an event, and database acknowledgement latency.
     pub lease_secs: i64,
-    /// Max concurrent HTTP deliveries within one `run_delivery_once` batch.
+    /// Max admitted events, including results waiting for database acknowledgement.
     pub concurrency: usize,
     /// Freshness bound (seconds) for the start-before-end gate (Audit 2, A2). An
     /// `end`/`cancel` row is held back only while the task's `start` row is pending
@@ -78,7 +68,7 @@ pub struct DeliveryConfig {
     pub start_stale_secs: i64,
 }
 
-/// Background loop: drains the webhook outbox at a fixed interval until shutdown.
+/// Continuously refill free delivery slots and persist ready results first.
 pub async fn delivery_loop(
     evaluator: Arc<ActionExecutor>,
     pool: DbPool,
@@ -88,122 +78,238 @@ pub async fn delivery_loop(
     nudges: WorkerNudges,
 ) {
     const BACKLOG_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+    let interval = interval.max(std::time::Duration::from_millis(1));
     let mut last_backlog_sample = Instant::now() - BACKLOG_SAMPLE_INTERVAL;
+    let mut pump = DeliveryPump::default();
+    let mut scan = true;
+    let mut stopping = false;
+    let mut retry_at = None;
+    let mut poll_at = tokio::time::Instant::now() + interval;
 
     loop {
-        let loop_start = std::time::Instant::now();
-        let result = run_delivery_once(evaluator.as_ref(), &pool, cfg).await;
-        let sample_backlog =
-            result.is_ok() && last_backlog_sample.elapsed() >= BACKLOG_SAMPLE_INTERVAL;
-        match result {
-            Ok(0) => log::debug!("Delivery worker: no mature outbox rows"),
-            Ok(n) => log::debug!("Delivery worker: processed {} outbox rows", n),
-            Err(e) => log::error!("Delivery worker: error draining outbox: {:?}", e),
+        stopping |= *shutdown.borrow() || shutdown.has_changed().is_err();
+        pump.collect_ready();
+        if stopping && pump.is_empty() {
+            return;
         }
 
-        // Nudges can make this loop run many times per second. Backlog gauges do
-        // not need request-path freshness, so cap the aggregate scan frequency.
-        if sample_backlog {
-            if let Ok(mut conn) = pool.get().await {
-                match db_operation::outbox_backlog_stats(&mut conn).await {
-                    Ok(stats) => metrics::set_webhook_outbox_backlog(
-                        stats.ready,
-                        stats.leased,
-                        stats.oldest_ready_age_secs,
-                    ),
-                    Err(e) => log::warn!("Delivery worker: outbox backlog stats failed: {:?}", e),
+        let ready_to_retry = retry_at.is_none_or(|at| tokio::time::Instant::now() >= at);
+        if ready_to_retry
+            && (!pump.pending.is_empty() || (!stopping && scan && pump.free_slots(cfg) > 0))
+        {
+            let started = Instant::now();
+            let sample = last_backlog_sample.elapsed() >= BACKLOG_SAMPLE_INTERVAL;
+            let budget = if stopping || !scan { 0 } else { cfg.batch_size };
+            match pump
+                .advance(&evaluator, &pool, cfg, budget, Some(&shutdown), sample)
+                .await
+            {
+                Ok(fill) => {
+                    retry_at = None;
+                    if budget > 0 {
+                        scan = fill.filled;
+                    }
+                    if sample {
+                        last_backlog_sample = Instant::now();
+                    }
                 }
-            } else {
-                log::warn!("Delivery worker: failed to acquire connection for backlog stats");
+                Err(e) => {
+                    log::error!("Delivery worker: database step failed: {:?}", e);
+                    stopping |= *shutdown.borrow() || shutdown.has_changed().is_err();
+                    if stopping {
+                        // Shutdown cannot wait indefinitely for DB recovery. The
+                        // durable rows remain recoverable after their leases expire.
+                        log::warn!(
+                            "Delivery worker: leaving {} unrecorded results for lease recovery",
+                            pump.pending.len()
+                        );
+                        pump.pending.clear();
+                        retry_at = None;
+                    } else {
+                        // Keep ready outcomes, and stop admission, until their
+                        // fenced marks can be written. No repeat HTTP is needed.
+                        retry_at = Some(tokio::time::Instant::now() + interval);
+                    }
+                }
             }
-            last_backlog_sample = Instant::now();
+            metrics::record_worker_loop_iteration("delivery", started.elapsed().as_secs_f64());
+            poll_at = tokio::time::Instant::now() + interval;
+            continue;
         }
-        metrics::record_worker_loop_iteration("delivery", loop_start.elapsed().as_secs_f64());
 
-        // B4: a transition that enqueued an outbox row (end/failure/cancel/
-        // batch_complete) nudges this loop so the delivery doesn't wait a full tick.
-        // `notify_one` keeps a nudge fired mid-iteration from being lost. The poll
-        // remains the correctness/fallback path (e.g. rows maturing off a backoff, or
-        // a lease expiring after a crash).
+        let wake_at = retry_at.map_or(poll_at, |retry| retry.min(poll_at));
         tokio::select! {
-            _ = shutdown.changed() => {
-                log::info!("Delivery worker: shutdown signal received, exiting");
-                return;
+            biased;
+            _ = shutdown.changed(), if !stopping => {
+                stopping = true;
+                retry_at = None;
             }
-            _ = nudges.delivery.notified() => {}
-            _ = rt::time::sleep(interval) => {}
+            Some(result) = pump.running.join_next(), if !pump.running.is_empty() => {
+                pump.push_result(result);
+                scan = true;
+            }
+            _ = nudges.delivery.notified(), if !stopping => { scan = true; }
+            _ = rt::time::sleep_until(wake_at) => {
+                scan = true;
+                poll_at = tokio::time::Instant::now() + interval;
+            }
         }
     }
 }
 
-/// Drain one batch of mature outbox rows. Returns the number of rows processed.
-///
-/// Exposed (and re-exported via `workers::run_delivery_once`) so integration tests
-/// can drive delivery deterministically instead of waiting on the timer.
-///
-/// Four phases (see module docs): short claim tx (with lease), out-of-tx prefetch,
-/// parallel HTTP delivery, then short mark statements. Borrow a connection for
-/// claim/prefetch, return it before HTTP, and reacquire once for the result batch.
-/// If reacquisition fails, the leased rows remain available for a later retry.
+/// Process at most `batch_size` due rows, recording each result as it completes.
+/// The finite budget makes this helper deterministic for integration tests;
+/// production uses the same pump continuously, without a barrier between batches.
 pub async fn run_delivery_once(
     evaluator: &ActionExecutor,
     pool: &DbPool,
     cfg: DeliveryConfig,
 ) -> Result<usize, db_operation::DbError> {
-    let mut conn = pool
-        .get()
-        .await
-        .map_err(|e| db_operation::DbError::Pool(e.to_string()))?;
-    // Phase 1 — claim with lease (short transaction).
-    let claimed = db_operation::run_in_transaction(&mut conn, |conn| {
-        let batch_size = cfg.batch_size;
-        let lease = cfg.lease_secs;
-        let start_stale = cfg.start_stale_secs;
-        Box::pin(async move {
-            db_operation::claim_due_outbox_leased(conn, batch_size, lease, start_stale).await
-        })
-    })
-    .await?;
-
-    let processed = claimed.len();
-    if claimed.is_empty() {
-        return Ok(0);
-    }
-
-    // Phase 2 — prefetch delivery inputs (autocommit reads). Fast-path marks are
-    // collected separately so they don't need an HTTP round-trip.
-    let mut plans: Vec<DeliveryPlan> = Vec::with_capacity(claimed.len());
-    for prepared in prepare_rows(&mut conn, claimed).await? {
-        match prepared {
-            Prepared::Mark(mark) => apply_mark(&mut conn, mark).await,
-            Prepared::Deliver(plan) => plans.push(plan),
+    let mut pump = DeliveryPump::default();
+    let mut remaining = cfg.batch_size.max(0);
+    let mut processed = 0;
+    loop {
+        pump.collect_ready();
+        if !pump.pending.is_empty() || (remaining > 0 && pump.free_slots(cfg) > 0) {
+            let fill = pump
+                .advance(evaluator, pool, cfg, remaining, None, false)
+                .await?;
+            processed += fill.claimed;
+            remaining = if fill.filled {
+                remaining - fill.claimed as i64
+            } else {
+                0
+            };
+            continue;
+        }
+        match pump.running.join_next().await {
+            Some(result) => pump.push_result(result),
+            None => return Ok(processed),
         }
     }
-    drop(conn);
-    if plans.is_empty() {
-        return Ok(processed);
+}
+
+#[derive(Default)]
+struct DeliveryPump {
+    // JoinSet keeps HTTP progressing independently while the coordinator borrows
+    // a connection. Completed jobs still occupy a slot until their mark is saved.
+    running: tokio::task::JoinSet<DeliveryOutcome>,
+    pending: std::collections::VecDeque<MarkAction>,
+}
+
+struct Fill {
+    claimed: usize,
+    filled: bool,
+}
+
+impl DeliveryPump {
+    fn is_empty(&self) -> bool {
+        self.running.is_empty() && self.pending.is_empty()
     }
 
-    // Phase 3 — deliver in parallel without retaining a pooled connection.
-    let outcomes: Vec<DeliveryOutcome> = stream::iter(plans.into_iter().map(|plan| {
-        let evaluator = &*evaluator;
-        async move { deliver_plan(evaluator, plan, cfg).await }
-    }))
-    .buffer_unordered(cfg.concurrency.max(1))
-    .collect()
-    .await;
-
-    // Phase 4 — reacquire once for all results, preserving batched pool access.
-    // Short autocommit statements; each mark still checks the original lease token.
-    let mut conn = pool
-        .get()
-        .await
-        .map_err(|e| db_operation::DbError::Pool(e.to_string()))?;
-    for outcome in outcomes {
-        apply_mark(&mut conn, outcome.mark).await;
+    fn free_slots(&self, cfg: DeliveryConfig) -> usize {
+        cfg.concurrency
+            .max(1)
+            .saturating_sub(self.running.len() + self.pending.len())
     }
 
-    Ok(processed)
+    fn push_result(&mut self, result: Result<DeliveryOutcome, tokio::task::JoinError>) {
+        match result {
+            Ok(outcome) => self.pending.push_back(outcome.mark),
+            Err(e) => log::error!(
+                "Delivery worker: HTTP task failed; lease will recover it: {:?}",
+                e
+            ),
+        }
+    }
+
+    fn collect_ready(&mut self) {
+        while let Some(result) = self.running.try_join_next() {
+            self.push_result(result);
+        }
+    }
+
+    async fn flush(&mut self, conn: &mut Conn<'_>) -> Result<(), db_operation::DbError> {
+        // A failed or ambiguous write keeps its outcome for retry. Every mark
+        // checks the lease token, so an already-applied/stale mark is a safe no-op.
+        self.collect_ready();
+        while let Some(mark) = self.pending.front() {
+            apply_mark(conn, mark).await?;
+            self.pending.pop_front();
+            self.collect_ready();
+        }
+        Ok(())
+    }
+
+    async fn advance(
+        &mut self,
+        evaluator: &ActionExecutor,
+        pool: &DbPool,
+        cfg: DeliveryConfig,
+        budget: i64,
+        shutdown: Option<&watch::Receiver<bool>>,
+        sample_backlog: bool,
+    ) -> Result<Fill, db_operation::DbError> {
+        let mut conn = pool
+            .get()
+            .await
+            .map_err(|e| db_operation::DbError::Pool(e.to_string()))?;
+        // Include completions arriving during pool acquisition, and share this
+        // checkout between their marks and the next bounded claim/prefetch.
+        self.flush(&mut conn).await?;
+        let stopping = shutdown.is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err());
+        let limit = if stopping {
+            0
+        } else {
+            budget.min(cfg.batch_size).min(self.free_slots(cfg) as i64)
+        };
+        let mut claimed = 0;
+        if limit > 0 {
+            let rows = db_operation::run_in_transaction(&mut conn, |conn| {
+                Box::pin(async move {
+                    db_operation::claim_due_outbox_leased(
+                        conn,
+                        limit,
+                        cfg.lease_secs,
+                        cfg.start_stale_secs,
+                    )
+                    .await
+                })
+            })
+            .await?;
+            claimed = rows.len();
+            if !rows.is_empty() {
+                // If preparation fails, these durable claims recover by lease
+                // expiry, as before. No HTTP has been sent for this group yet.
+                for prepared in prepare_rows(&mut conn, rows).await? {
+                    match prepared {
+                        Prepared::Mark(mark) => self.pending.push_back(mark),
+                        Prepared::Deliver(plan) => {
+                            let evaluator = evaluator.clone();
+                            self.running
+                                .spawn(async move { deliver_plan(&evaluator, plan, cfg).await });
+                        }
+                    }
+                }
+            }
+        }
+        self.flush(&mut conn).await?;
+        if sample_backlog {
+            match db_operation::outbox_backlog_stats(&mut conn).await {
+                Ok(stats) => metrics::set_webhook_outbox_backlog(
+                    stats.ready,
+                    stats.leased,
+                    stats.oldest_ready_age_secs,
+                ),
+                Err(e) => log::warn!("Delivery worker: outbox backlog stats failed: {:?}", e),
+            }
+        }
+        Ok(Fill {
+            claimed,
+            filled: limit > 0 && claimed as i64 == limit,
+        })
+        // conn drops here; never wait for an HTTP result holding a connection.
+    }
 }
 
 /// Outcome of preparing a row for delivery: either an immediate mark (fast-path) or a
@@ -664,11 +770,10 @@ async fn deliver_plan(
     }
 }
 
-/// Phase 4 helper: post one mark via the existing autocommit helpers. A DB error is
-/// logged and swallowed (the lease will re-deliver; at-least-once). This never rolls
-/// back marks already posted for other rows in the batch.
-async fn apply_mark<'a>(conn: &mut Conn<'a>, mark: MarkAction) {
-    let (result, mark_label) = match &mark {
+/// Apply a fenced mark without consuming it, so a transient DB failure can retry
+/// the same outcome without repeating HTTP. Other marks remain independently committed.
+async fn apply_mark(conn: &mut Conn<'_>, mark: &MarkAction) -> Result<(), db_operation::DbError> {
+    let (result, mark_label) = match mark {
         MarkAction::Success {
             key,
             lease_token,
@@ -711,18 +816,18 @@ async fn apply_mark<'a>(conn: &mut Conn<'a>, mark: MarkAction) {
         }
     };
 
-    let key = match &mark {
+    let key = match mark {
         MarkAction::Success { key, .. }
         | MarkAction::Retry { key, .. }
         | MarkAction::Exhausted { key, .. } => key,
     };
-    match result {
+    match &result {
         Err(e) => {
             // A DB failure leaves the leased row in place; it will mature and retry.
             metrics::record_webhook_mark_failure(mark_label);
             log::error!(
                 "Delivery worker: failed to post outbox mark for key {} ({:?}); \
-                 lease will re-deliver",
+                 result retained for retry",
                 key,
                 e
             );
@@ -734,6 +839,7 @@ async fn apply_mark<'a>(conn: &mut Conn<'a>, mark: MarkAction) {
         ),
         Ok(true) => {}
     }
+    result.map(|_| ())
 }
 
 /// Exponential backoff: `base^(prior_attempts + 1)` seconds, capped.

@@ -980,25 +980,12 @@ async fn test_audit2_a4_claimed_cancel_without_action_delivers_no_http() {
     let _ = shutdown.send(());
 }
 
-/// A4 permit-wait window — a task canceled while queued for a webhook permit (claimed,
-/// but its `start` outbox row not yet created) must NOT receive on_start at all.
-///
-/// In that window the cancel outbox row is not held by the start-before-end gate
-/// (there is no start row yet), so it can be drained as a zero-action fast-path
-/// BEFORE on_start fires. If on_start then fires anyway, the consumer starts zombie
-/// work whose cancel has already been consumed — unfixable after the fact. The fix
-/// re-checks the task's status in `start_task` right after creating the start row
-/// (post-permit): no longer `Claimed` ⇒ skip on_start and complete the start row
-/// (nothing executed, so the zero-action cancel was correct). Any transition landing
-/// after that check is gated normally (start row pending + fresh) until the
-/// completion tx commits the cancel actions.
-///
-/// Deterministic setup: `webhook_concurrency = 1`; T1's slow on_start (2 s) holds the
-/// only permit while T2 — claimed in the same iteration — waits. T2 is canceled and
-/// the outbox drained during that wait. With the fix, T2's on_start never fires and
-/// its start row ends `success`; with the fix reverted, T2's mock receives on_start.
+/// A4: cancellation before a webhook slot becomes available must never start
+/// zombie work. Bounded admission now leaves the second task Pending instead of
+/// Claimed in a semaphore queue. Canceling it produces neither a start record nor
+/// a cancel notification, and freeing the first slot must not call its on_start.
 #[tokio::test]
-async fn test_audit2_a4_cancel_during_permit_wait_skips_on_start() {
+async fn test_audit2_a4_cancel_before_admission_skips_on_start() {
     let (_g, state) = setup_test_app().await;
     let app = test_service!(state);
 
@@ -1053,24 +1040,22 @@ async fn test_audit2_a4_cancel_during_permit_wait_skips_on_start() {
         .await;
     });
 
-    // Both tasks are claimed in the first iteration; T1's webhook is in flight, T2 is
-    // Claimed, queued for the permit, with NO start row yet.
+    // T1 is in flight. T2 remains Pending, with no start record or reservation.
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_task_status(
         &app,
         t2_id,
-        StatusKind::Claimed,
-        "T2 should be Claimed, waiting for the permit",
+        StatusKind::Pending,
+        "T2 must stay Pending until a webhook slot becomes available",
     )
     .await;
     assert_eq!(
         start_row_status(&state.pool, t2_id).await,
         None,
-        "T2's start row must not exist yet (permit-wait window)"
+        "T2 has not been admitted"
     );
 
-    // Cancel T2 during the permit wait and drain: the cancel row is not gated (no
-    // start row) and is consumed as a zero-action fast-path — as in production.
+    // Cancel before admission: no start was sent, so no cancel event is needed.
     let req = actix_web::test::TestRequest::delete()
         .uri(&format!("/task/{}", t2_id))
         .to_request();
@@ -1079,11 +1064,11 @@ async fn test_audit2_a4_cancel_during_permit_wait_skips_on_start() {
     drain_outbox(&state).await;
     assert_eq!(
         cancel_outbox_count(&state.pool, t2_id, "success").await,
-        1,
-        "T2's cancel row was drained (zero-action) during the permit wait"
+        0,
+        "canceling a Pending task does not enqueue a cancel webhook"
     );
 
-    // Let T1's slow webhook finish; the loop then processes T2 with the permit.
+    // Free the first slot; the canceled task must not be admitted.
     tokio::time::sleep(Duration::from_millis(2500)).await;
     let _ = shutdown_tx.send(true);
     let _ = handle.await;
@@ -1091,12 +1076,12 @@ async fn test_audit2_a4_cancel_during_permit_wait_skips_on_start() {
     assert_eq!(
         t2_start_hits.load(Ordering::SeqCst),
         0,
-        "T2's on_start must NOT fire for a task that left Claimed during the permit wait"
+        "T2's on_start must not fire after cancellation before admission"
     );
     assert_eq!(
         start_row_status(&state.pool, t2_id).await.as_deref(),
-        Some("success"),
-        "T2's start row must be completed by the skip path (gate released)"
+        None,
+        "a task canceled before admission never creates a start record"
     );
     assert_task_status(&app, t2_id, StatusKind::Canceled, "T2 stays Canceled").await;
 
@@ -4089,25 +4074,14 @@ async fn test_audit2_b4_patch_nudges_delivery_loop() {
 }
 
 // =============================================================================
-// B2 — heartbeat `last_updated` while waiting for the semaphore permit
+// B2 — keep excess work Pending until an execution slot becomes available
 // =============================================================================
 
-/// B2 — a claimed task waiting for a permit is heartbeated and not requeued.
-///
-/// # Setup
-/// `webhook_concurrency = 1`, `claim_timeout = 3 s`, heartbeat interval = 1 s.
-/// Two tasks are created. The first task's on_start webhook takes ~4 s (slow server),
-/// saturating the single permit. The second task is claimed and parked on the
-/// semaphore. Without the heartbeat, its `last_updated` goes stale after 3 s and
-/// requeue-stale would reclaim it (Claimed → Pending churn). With the heartbeat,
-/// `last_updated` is bumped every 1 s and the task stays Claimed until the permit
-/// becomes available.
-///
-/// # Assertion
-/// After the slow on_start finishes (~4 s), both tasks reach Running — the second
-/// one was NOT requeued. Both on_start webhooks fire exactly once (no churn).
+/// B2: a second task waits Pending while a slow on_start occupies the only
+/// execution slot. Both requests execute once and both tasks reach Running.
+/// The old permit-wait heartbeat is unnecessary with bounded admission.
 #[tokio::test]
-async fn test_audit2_b2_heartbeat_prevents_requeue_during_permit_wait() {
+async fn test_audit2_b2_pending_backlog_waits_for_available_slot() {
     let (_g, state) = setup_test_app().await;
     let app = test_service!(state);
 
@@ -4115,7 +4089,7 @@ async fn test_audit2_b2_heartbeat_prevents_requeue_during_permit_wait() {
     let (webhook_url, shutdown_server) =
         spawn_slow_200_webhook_server(hits.clone(), Duration::from_secs(4));
 
-    // Short claim_timeout (3s) + concurrency=1 → the second task blocks on the permit.
+    // The second task waits Pending, outside the claim timeout, until a slot is free.
     let claim_timeout = Duration::from_secs(3);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let evaluator = state.action_executor.clone();
@@ -4168,8 +4142,7 @@ async fn test_audit2_b2_heartbeat_prevents_requeue_during_permit_wait() {
 
     assert!(
         both_running,
-        "both tasks must reach Running — the heartbeat should prevent requeue of the second \
-         task while it waits for the permit (claim_timeout=3s, slow webhook=4s)"
+        "both tasks must reach Running after sequential admission (slow webhook=4s)"
     );
     assert_eq!(
         hits.load(Ordering::SeqCst),

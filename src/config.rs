@@ -118,7 +118,7 @@ pub struct PaginationConfig {
 /// Worker loop configuration.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
-    /// Interval between worker loop iterations
+    /// Fallback polling interval; the start worker also refills on completion.
     pub loop_interval: Duration,
 
     /// Interval for timeout check loop
@@ -136,7 +136,7 @@ pub struct WorkerConfig {
     /// Whether dead-end ancestor cancellation is enabled (safety valve)
     pub dead_end_cancel_enabled: bool,
 
-    /// Maximum number of Pending tasks to fetch per start_loop iteration
+    /// Maximum successful claims per start refill, also bounded by free slots.
     pub start_batch_size: i64,
 
     /// Maximum number of timed-out Running tasks processed per timeout_loop pass.
@@ -147,10 +147,10 @@ pub struct WorkerConfig {
     /// Maximum number of concurrent webhook executions in start_loop
     pub webhook_concurrency: usize,
 
-    /// Interval between webhook delivery-loop iterations (outbox drain)
+    /// Fallback polling and database-error retry interval for delivery.
     pub webhook_delivery_interval: Duration,
 
-    /// Max outbox rows claimed per delivery-loop iteration
+    /// Max outbox rows per claim, also bounded by free execution slots.
     pub webhook_delivery_batch_size: i64,
 
     /// Max delivery attempts before an outbox row is marked `exhausted`
@@ -163,11 +163,11 @@ pub struct WorkerConfig {
     pub webhook_retry_backoff_cap_secs: i64,
 
     /// Lease applied to an outbox row at claim time (seconds): the row is not
-    /// re-claimable until the lease expires. Must exceed the worst-case single-row
-    /// delivery time so an in-flight delivery is never double-claimed.
+    /// re-claimable until the lease expires. Cover preparation, sequential HTTP
+    /// actions and acknowledgement latency; expiry permits duplicate delivery.
     pub webhook_delivery_lease_secs: i64,
 
-    /// Max concurrent HTTP deliveries within one delivery-loop batch.
+    /// Max active deliveries plus results awaiting database persistence.
     pub webhook_delivery_concurrency: usize,
 
     /// Interval between metrics-sampler iterations (gauges: tasks_by_status,

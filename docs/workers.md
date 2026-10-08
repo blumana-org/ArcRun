@@ -11,23 +11,25 @@ The server starts six background workers. Each receives a shared shutdown signal
 | Retention | Clean unused rule slots and archive/purge eligible tasks | 1 hour |
 | Metrics sampler | Refresh task and connection-pool gauges | 15 seconds |
 
-Cadences are waits between iterations, not execution deadlines. Database and HTTP work can lengthen an iteration.
+Start and delivery refill available execution slots continuously. Their cadences are fallback polling intervals when no work can be admitted. Other cadences are waits between iterations; none are execution deadlines.
 
 ## Start worker
 
 The scheduler first acquires leadership through a PostgreSQL advisory lock held on a dedicated, non-pooled connection. Only the leader schedules tasks; standby replicas retry on subsequent iterations.
 
-Pending tasks are scanned in descending priority, then ascending creation time and UUID. The scan continues past blocked tasks so they cannot hide eligible work later in the backlog. `WORKER_START_BATCH_SIZE` limits successful claims per iteration, not the number of visible candidates.
+Pending tasks are scanned in descending priority, then ascending creation time and UUID. The scan continues past blocked tasks so they cannot hide eligible work later in the backlog. Each refill claims at most `WORKER_START_BATCH_SIZE` tasks and never more than the available execution slots; the candidate scan is not limited by this cap. Leadership is checked before each refill.
 
 For each eligible task, the scheduler:
 
 1. Reserves all required rule slots and changes Pending to Claimed atomically.
-2. Waits for a webhook-concurrency permit, refreshing the claim timestamp while waiting.
+2. Immediately dispatches it into an available execution slot. Excess work remains Pending, without reserved rule slots or claim-timeout heartbeats.
 3. Creates or claims the start-execution record and rechecks that the task is still Claimed.
 4. Calls `on_start` without holding a pool connection.
 5. Records the result. A successful start persists any valid cancel action and changes the task to Running if it is still Claimed. A failed start fails the task and propagates the result.
 
 The Claimed state includes the HTTP call. A receiver may report completion during this state; the later start-result transaction does not overwrite that terminal state.
+
+An execution slot stays occupied through the result transaction, bounding the number of tasks waiting for the database. A finished start frees that local slot for another task without waiting for slower requests. It does not release the Running task's concurrency/capacity reservations. Long HTTP calls or database stalls can still exceed the claim inactivity timeout.
 
 ### Concurrency and capacity reservations
 
@@ -66,9 +68,9 @@ A `202` response acknowledges in-memory acceptance. Abrupt process termination c
 
 ## Delivery loop
 
-The delivery worker claims due outbox rows, loads the necessary actions, sends HTTP requests, and records their outcomes. Requests for different events run concurrently; actions belonging to one event run sequentially.
+The delivery worker claims due outbox rows, loads the necessary actions, sends HTTP requests, and records their outcomes as they finish. Ready marks take priority over new claims; one pool checkout coalesces available results and refills free slots. Active deliveries plus results awaiting persistence are bounded by `WEBHOOK_DELIVERY_CONCURRENCY`. A transient database error retains those results and pauses admission until persistence succeeds.
 
-The lease, retries, ordering, and receiver contract are documented in [Webhooks](webhooks.md#delivery-loop). `run_delivery_once` exposes one iteration for integration tests.
+The lease, retries, ordering, and receiver contract are documented in [Webhooks](webhooks.md#delivery-loop). `run_delivery_once` exposes the same pipeline with a finite total claim budget for integration tests. It returns database errors to its caller; in that case unrecorded events recover through their durable leases.
 
 ## Retention worker
 
@@ -90,4 +92,4 @@ The delivery loop samples outbox backlog separately, at most once every 15 secon
 
 Handlers and workers notify the start or delivery loop after commits that make work available. These wakeups are local to a process. Polling provides the fallback for other replicas, retry deadlines, and lost wakeups.
 
-Workers observe the shutdown signal at their loop boundaries. A process that exits during notification delivery leaves durable outbox rows available for retry after their leases expire.
+Start and delivery stop new admissions when they observe shutdown, then drain already-admitted work. If delivery cannot persist a result during shutdown, it leaves the durable event for recovery after lease expiry. Abrupt process termination has the same recovery mechanism. Other workers observe shutdown at their loop boundaries.

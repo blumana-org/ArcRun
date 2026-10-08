@@ -132,16 +132,16 @@ There is no delivery order across tasks. A child's start may arrive before its p
 
 ## Delivery loop
 
-The delivery worker processes a batch in four phases:
+Each event passes through four phases. These overlap across events without waiting for a whole batch to finish:
 
-1. **Claim:** select due queue rows with `FOR UPDATE SKIP LOCKED`, assign a fresh lease token, and defer their eligibility by `WEBHOOK_DELIVERY_LEASE_SECS` in a short transaction.
+1. **Claim:** select due queue rows with `FOR UPDATE SKIP LOCKED`, assign a fresh lease token, and defer their eligibility by `WEBHOOK_DELIVERY_LEASE_SECS` in a short transaction. The claim is bounded by both free execution slots and `WEBHOOK_DELIVERY_BATCH_SIZE`.
 2. **Prepare:** load task or batch data and actions. Events with no actions, or whose subject no longer exists, are marked successful without HTTP. Malformed batch action data is exhausted.
 3. **Send:** deliver up to `WEBHOOK_DELIVERY_CONCURRENCY` events concurrently, with sequential actions within each event.
-4. **Record:** move successful or exhausted events into history; update failed events with another attempt and retry time.
+4. **Record:** promptly move successful or exhausted events into history; update failed events with another attempt and retry time. Coalesce ready results, persist them before new claims, then refill available slots.
 
-Every result write checks the lease token. A worker finishing after another worker reclaimed the event cannot overwrite its state. Failed result writes leave the event recoverable after lease expiry.
+Every result write checks the lease token. A worker finishing after another worker reclaimed the event cannot overwrite its state. A pool or result-write failure retains the result and retries its database mark without repeating HTTP. Admission pauses during this recovery, and active requests plus pending results never exceed the concurrency limit. If the process exits, the durable event remains recoverable after lease expiry.
 
-HTTP runs without retaining a pool connection, transaction, or row lock. The worker returns its connection after preparation and reacquires one for the result batch. If acquisition or a result write fails, the event remains recoverable after lease expiry. The lease must cover time waiting within a delivery batch as well as the sequential actions for an event.
+HTTP does not retain a pool connection, transaction, or row lock. Available results share a checkout with the next bounded claim/preparation. The lease must cover preparation, sequential actions for an event, and acknowledgement latency. There is no claimed queue waiting for an HTTP slot. An expired lease or a crash after HTTP success can still cause duplicate delivery; the receiver's idempotency contract is unchanged.
 
 ## Inspecting deliveries
 

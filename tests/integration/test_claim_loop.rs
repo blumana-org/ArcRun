@@ -146,7 +146,9 @@ async fn test_head_of_line_eligible_low_priority_claimed() {
 
     // Drive one claim iteration with a generous cap and tiny page size.
     let mut conn = state.pool.get().await.unwrap();
-    let claimed = arcrun::workers::run_claim_loop(&mut conn, 50, 500).await;
+    // A one-slot refill first reads one blocked candidate, then must continue
+    // with full pages to find the eligible task past the blocked prefix.
+    let claimed = arcrun::workers::run_claim_loop(&mut conn, 1, 500).await;
     drop(conn);
 
     // The eligible low-priority task must have been claimed despite being last in order.

@@ -18,7 +18,6 @@ use diesel::prelude::*;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
@@ -50,10 +49,9 @@ enum StartPhaseA {
     },
 }
 
-/// Single-replica / test entry point (no leader lease): this loop is ALWAYS the
-/// leader and runs every tick. Behavior is identical to before the D7 lease was
-/// added — the existing tests drive this directly. Production uses
-/// [`start_loop_leased`] instead.
+/// Single-replica / test entry point. Production uses [`start_loop_leased`].
+/// `claim_timeout` remains in the public signature for compatibility; with no
+/// semaphore queue, only the timeout worker and start-idempotency logic use it.
 #[allow(
     clippy::too_many_arguments,
     reason = "Keep the test entry point aligned with the leased worker configuration."
@@ -65,55 +63,29 @@ pub async fn start_loop(
     dead_end_enabled: bool,
     start_batch_size: i64,
     webhook_concurrency: usize,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
     nudges: WorkerNudges,
-    claim_timeout: std::time::Duration,
+    _claim_timeout: std::time::Duration,
 ) {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(webhook_concurrency));
-    // B2: heartbeat interval = claim_timeout / 3, so a task waiting for a permit
-    // has its `last_updated` refreshed at least twice before requeue-stale would
-    // consider it stale.
-    let heartbeat_interval = claim_timeout / 3;
-    metrics::set_start_loop_leader(true);
-
-    loop {
-        run_start_iteration(
-            evaluator,
-            &pool,
+    run_start_worker(
+        evaluator,
+        pool,
+        StartConfig {
+            interval,
             dead_end_enabled,
-            start_batch_size,
-            &semaphore,
-            &nudges,
-            heartbeat_interval,
-        )
-        .await;
-
-        // B4: wake immediately on an in-process nudge (a POST /task, an unblocked
-        // child, or a resume) instead of always waiting a full tick. `notify_one`
-        // stores a permit, so a nudge that arrived while this iteration was running
-        // still fires the next one — see `WorkerNudges`. The poll remains the
-        // correctness/fallback path.
-        tokio::select! {
-            _ = shutdown.changed() => {
-                log::info!("Start worker: shutdown signal received, exiting");
-                return;
-            }
-            _ = nudges.start.notified() => {}
-            _ = rt::time::sleep(interval) => {}
-        }
-    }
+            batch_size: start_batch_size,
+            concurrency: webhook_concurrency,
+        },
+        shutdown,
+        nudges,
+        None,
+    )
+    .await;
 }
 
-/// Multi-replica entry point (Audit 2, D7): a leader lease gates scheduling so only
-/// ONE replica claims/starts tasks at a time. Leadership is a session-scoped
-/// `pg_try_advisory_lock` on a DEDICATED connection this loop owns for its whole
-/// lifetime (a pooled connection would leak the session lock on return). The leader
-/// runs a normal iteration each tick; a standby just re-contends and skips. Failover
-/// is automatic: when the leader's process dies its connection drops and the lock is
-/// released, so a standby wins the lock on its next tick.
-///
-/// Single-replica (the common case) is unchanged: the sole loop wins the lock at
-/// startup and runs every tick, exactly like [`start_loop`].
+/// Only the leader admits work. Its session advisory lock lives on a dedicated
+/// connection, verified before every refill and held until admitted work drains.
+/// A process crash releases the lock so another replica can take over.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_loop_leased(
     database_url: String,
@@ -123,78 +95,125 @@ pub async fn start_loop_leased(
     dead_end_enabled: bool,
     start_batch_size: i64,
     webhook_concurrency: usize,
+    shutdown: watch::Receiver<bool>,
+    nudges: WorkerNudges,
+    _claim_timeout: std::time::Duration,
+) {
+    run_start_worker(
+        evaluator,
+        pool,
+        StartConfig {
+            interval,
+            dead_end_enabled,
+            batch_size: start_batch_size,
+            concurrency: webhook_concurrency,
+        },
+        shutdown,
+        nudges,
+        Some(&database_url),
+    )
+    .await;
+}
+
+struct StartConfig {
+    interval: std::time::Duration,
+    dead_end_enabled: bool,
+    batch_size: i64,
+    concurrency: usize,
+}
+
+async fn run_start_worker(
+    evaluator: &ActionExecutor,
+    pool: DbPool,
+    cfg: StartConfig,
     mut shutdown: watch::Receiver<bool>,
     nudges: WorkerNudges,
-    claim_timeout: std::time::Duration,
+    database_url: Option<&str>,
 ) {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(webhook_concurrency));
-    let heartbeat_interval = claim_timeout / 3;
     let mut lease = LeaderLease::new();
+    let mut running = JoinSet::new();
+    let concurrency = cfg.concurrency.max(1);
+    let interval = cfg.interval.max(std::time::Duration::from_millis(1));
+    let mut poll_at = tokio::time::Instant::now() + interval;
+    let mut scan = true;
+    let mut stopping = false;
+    let mut processed = 0;
 
     loop {
-        // Acquire / verify leadership on the dedicated lease connection.
-        let is_leader = lease.ensure(&database_url).await;
-        metrics::set_start_loop_leader(is_leader);
+        stopping |= *shutdown.borrow() || shutdown.has_changed().is_err();
+        while let Some(result) = running.try_join_next() {
+            processed += start_result_count(result);
+            scan = true;
+        }
+        if stopping && running.is_empty() {
+            metrics::record_tasks_processed_per_loop(processed);
+            return;
+        }
 
-        if is_leader {
-            run_start_iteration(
-                evaluator,
-                &pool,
-                dead_end_enabled,
-                start_batch_size,
-                &semaphore,
-                &nudges,
-                heartbeat_interval,
-            )
-            .await;
+        if !stopping && scan && running.len() < concurrency {
+            let started = std::time::Instant::now();
+            let leader = match database_url {
+                Some(url) => lease.ensure(url).await,
+                None => true,
+            };
+            metrics::set_start_loop_leader(leader);
+            stopping |= *shutdown.borrow() || shutdown.has_changed().is_err();
+            scan = false;
+            if leader && !stopping {
+                // No Claimed queue waiting on a semaphore: every admitted task
+                // already has a slot, held through HTTP and the result transaction.
+                // Excess work remains Pending, with no business quota reserved.
+                let free = (concurrency - running.len()) as i64;
+                let cap = if cfg.batch_size > 0 {
+                    cfg.batch_size.min(free)
+                } else {
+                    free
+                };
+                let tasks = claim_phase(&pool, cap).await;
+                scan = tasks.len() as i64 == cap;
+                for task in tasks {
+                    let pool = pool.clone();
+                    let evaluator = evaluator.clone();
+                    let nudges = nudges.clone();
+                    let dead_end_enabled = cfg.dead_end_enabled;
+                    running.spawn(async move {
+                        let _guard = metrics::WebhooksInFlightGuard::new("start");
+                        execute_webhook_for_task(&evaluator, task, &pool, dead_end_enabled, &nudges)
+                            .await
+                    });
+                }
+            }
+            metrics::record_worker_loop_iteration("start", started.elapsed().as_secs_f64());
+            metrics::record_tasks_processed_per_loop(processed);
+            processed = 0;
+            poll_at = tokio::time::Instant::now() + interval;
+            continue;
         }
 
         tokio::select! {
-            _ = shutdown.changed() => {
-                log::info!("Start worker: shutdown signal received, exiting");
-                // `lease` (and its dedicated connection) drops here, releasing the
-                // advisory lock so a standby can take over.
-                return;
+            biased;
+            _ = shutdown.changed(), if !stopping => { stopping = true; }
+            Some(result) = running.join_next(), if !running.is_empty() => {
+                processed += start_result_count(result);
+                scan = true;
             }
-            _ = nudges.start.notified() => {}
-            _ = rt::time::sleep(interval) => {}
+            _ = nudges.start.notified(), if !stopping => { scan = true; }
+            _ = rt::time::sleep_until(poll_at) => {
+                scan = true;
+                poll_at = tokio::time::Instant::now() + interval;
+            }
         }
     }
 }
 
-/// Run ONE scheduling iteration: claim a batch of Pending tasks, then execute their
-/// on_start webhooks (parallel, bounded by the semaphore). Shared by [`start_loop`]
-/// and [`start_loop_leased`].
-async fn run_start_iteration(
-    evaluator: &ActionExecutor,
-    pool: &DbPool,
-    dead_end_enabled: bool,
-    start_batch_size: i64,
-    semaphore: &Arc<tokio::sync::Semaphore>,
-    nudges: &WorkerNudges,
-    heartbeat_interval: std::time::Duration,
-) {
-    let loop_start = std::time::Instant::now();
-
-    // Phase 1: Claim (sequential, single connection)
-    let claimed_tasks = claim_phase(pool, start_batch_size).await;
-
-    // Phase 2: Webhooks (parallel, JoinSet + Semaphore)
-    let tasks_processed = webhook_phase(
-        claimed_tasks,
-        evaluator,
-        pool,
-        semaphore,
-        dead_end_enabled,
-        nudges,
-        heartbeat_interval,
-    )
-    .await;
-
-    // Record worker loop metrics
-    let loop_duration = loop_start.elapsed().as_secs_f64();
-    metrics::record_worker_loop_iteration("start", loop_duration);
-    metrics::record_tasks_processed_per_loop(tasks_processed);
+fn start_result_count(result: Result<bool, tokio::task::JoinError>) -> usize {
+    match result {
+        Ok(processed) => usize::from(processed),
+        Err(e) => {
+            log::error!("Start worker: webhook task panicked: {:?}", e);
+            0
+        }
+    }
 }
 
 /// Advisory-lock key for the start_loop leader lease (Audit 2, D7). An arbitrary but
@@ -293,8 +312,8 @@ impl LeaderLease {
 const CLAIM_PAGE_SIZE: i64 = 500;
 
 /// Phase 1: Scan Pending tasks page-by-page (keyset pagination) and claim them.
-/// `claim_cap` (= `WORKER_START_BATCH_SIZE`) bounds the number of claims per
-/// iteration. Returns the list of successfully claimed tasks.
+/// `claim_cap` is bounded by both `WORKER_START_BATCH_SIZE` and free slots.
+/// Returns the list of successfully claimed tasks.
 async fn claim_phase(pool: &DbPool, claim_cap: i64) -> Vec<Task> {
     let conn = pool.get();
     let Ok(mut conn) = conn.await else {
@@ -328,7 +347,16 @@ pub async fn run_claim_loop<'a>(conn: &mut Conn<'a>, claim_cap: i64, page_size: 
     let mut pages_scanned: usize = 0;
 
     'pages: loop {
-        let page = match db_operation::list_pending_page(conn, cursor.as_ref(), page_size).await {
+        // Refills often need only one or two tasks. Avoid loading/deserializing
+        // hundreds of eligible rows only to throw them away on every completion.
+        // If this first small page is blocked, resume with full pages so a long
+        // blocked prefix is still scanned efficiently and cannot hide later work.
+        let page_limit = if cursor.is_none() && claim_cap > 0 {
+            page_size.min(claim_cap)
+        } else {
+            page_size
+        };
+        let page = match db_operation::list_pending_page(conn, cursor.as_ref(), page_limit).await {
             Ok(p) => p,
             Err(e) => {
                 log::error!("Start worker: error fetching pending page: {:?}", e);
@@ -425,7 +453,7 @@ pub async fn run_claim_loop<'a>(conn: &mut Conn<'a>, claim_cap: i64, page_size: 
         // Incomplete page => backlog fully scanned => done. We never stop early
         // on a full page unless the claim cap was reached above (no head-of-line
         // blocking from blind truncation).
-        if (page_len as i64) < page_size {
+        if (page_len as i64) < page_limit {
             break 'pages;
         }
     }
@@ -486,106 +514,13 @@ async fn flush_batch<'a>(
     }
 }
 
-/// Phase 2: Execute on_start webhooks for all claimed tasks in parallel,
-/// bounded by the semaphore.
-async fn webhook_phase(
-    claimed_tasks: Vec<Task>,
-    evaluator: &ActionExecutor,
-    pool: &DbPool,
-    semaphore: &Arc<tokio::sync::Semaphore>,
-    dead_end_enabled: bool,
-    nudges: &WorkerNudges,
-    heartbeat_interval: std::time::Duration,
-) -> usize {
-    if claimed_tasks.is_empty() {
-        return 0;
-    }
-
-    let mut join_set = JoinSet::new();
-
-    for t in claimed_tasks {
-        // B2: heartbeat `last_updated` while waiting for a permit, so
-        // requeue-stale does not reclaim the task during long semaphore waits.
-        let permit = acquire_permit_with_heartbeat(semaphore, pool, t.id, heartbeat_interval).await;
-
-        let pool = pool.clone();
-        let evaluator = evaluator.clone();
-        let nudges = nudges.clone();
-
-        join_set.spawn(async move {
-            let _permit = permit; // released on drop
-            let _guard = metrics::WebhooksInFlightGuard::new("start");
-            execute_webhook_for_task(&evaluator, t, &pool, dead_end_enabled, &nudges).await
-        });
-    }
-
-    let mut tasks_processed = 0usize;
-    while let Some(result) = join_set.join_next().await {
-        match result {
-            Ok(true) => tasks_processed += 1,
-            Ok(false) => {}
-            Err(e) => {
-                log::error!("Start worker: webhook task panicked: {:?}", e);
-            }
-        }
-    }
-
-    tasks_processed
-}
-
-/// Acquire a semaphore permit while heartbeating `last_updated` on the task so
-/// requeue-stale does not reclaim it during long waits (B2).
-///
-/// Every `heartbeat_interval` the task's `last_updated` is bumped via a cheap
-/// autocommit UPDATE. On DB error the heartbeat is logged and skipped — it is a
-/// best-effort optimization, not correctness (requeue-stale would reclaim and the
-/// next iteration retries).
-async fn acquire_permit_with_heartbeat(
-    semaphore: &Arc<tokio::sync::Semaphore>,
-    pool: &DbPool,
-    task_id: uuid::Uuid,
-    heartbeat_interval: std::time::Duration,
-) -> tokio::sync::OwnedSemaphorePermit {
-    use crate::schema::task::dsl;
-
-    let acquire_fut = Arc::clone(semaphore).acquire_owned();
-    tokio::pin!(acquire_fut);
-
-    loop {
-        tokio::select! {
-            permit = &mut acquire_fut => {
-                return permit.expect("semaphore should not be closed");
-            }
-            _ = rt::time::sleep(heartbeat_interval) => {
-                if let Ok(mut conn) = pool.get().await {
-                    let res = diesel::update(
-                        dsl::task.filter(
-                            dsl::id.eq(task_id)
-                                .and(dsl::status.eq(crate::models::StatusKind::Claimed)),
-                        ),
-                    )
-                    .set(dsl::last_updated.eq(diesel::dsl::now))
-                    .execute(&mut conn)
-                    .await;
-                    if let Err(e) = res {
-                        log::warn!(
-                            "B2 heartbeat: failed to bump last_updated for task {}: {:?}",
-                            task_id, e
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Execute the full on_start lifecycle for a single claimed task, split into three
 /// phases so a slow on_start webhook never holds a pool connection (B1 — the same
 /// discipline the delivery loop already uses for end/cancel deliveries):
 ///
 /// * **Phase A — `start_task_phase_a` (holds a connection, then drops it):** claim
 ///   the `start` outbox slot (idempotency guard), re-check the task is still
-///   `Claimed` (A4 permit-wait window), and load the `Start` actions. The connection
+///   `Claimed` (A4 claim-to-dispatch window), and load the `Start` actions. The connection
 ///   is returned to the pool at the end of this phase — BEFORE any HTTP runs. This
 ///   drop is the core of the B1 fix.
 /// * **Phase B — HTTP (holds NO connection):** execute the on_start webhooks
@@ -850,7 +785,7 @@ fn is_prefilter_blocked(task: &Task, ctx: &EvaluationContext) -> bool {
 /// Phase A of on_start processing: the connection-holding preamble (B1).
 ///
 /// Claims the `start` outbox slot (idempotency guard), performs the A4 re-check
-/// (the task may have left `Claimed` while waiting for a webhook permit), and loads
+/// (the task may have left `Claimed` since admission), and loads
 /// the `Start` actions. Runs NO HTTP — the caller drops the connection immediately
 /// after this returns and executes the webhooks (phase B) without a connection held.
 ///
@@ -892,7 +827,7 @@ async fn start_task_phase_a<'a>(
         });
     }
 
-    // A4: the task may have left `Claimed` while waiting for a webhook permit — a
+    // A4: the task may have left `Claimed` since admission — a
     // cancel enqueued in that window was NOT gated (the start row above did not exist
     // yet) and may already have been delivered as a zero-action fast-path. Firing
     // on_start now would hand the consumer zombie work whose cancel is already

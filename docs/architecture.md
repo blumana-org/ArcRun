@@ -99,7 +99,7 @@ Archiving waits for pending task notifications and batch-completion requirements
 
 API handlers acquire connections through retry and circuit-breaker logic. The breaker rejects acquisition while open, probes recovery after a delay, and closes after enough successful probes. Health and readiness endpoints use a separate two-second acquisition bound.
 
-Start and delivery webhooks release their pool connections during HTTP execution. Delivery borrows a connection for claim/preparation and reacquires one for the result batch; its lease token still fences every result write. Size the pool with handlers and other workers in mind.
+Start and delivery webhooks release their pool connections during HTTP execution. Both admit work only into free execution slots and refill without waiting for slower requests. Delivery coalesces ready results and borrows one connection for their fenced marks and the next claim/preparation. Pool errors retain delivery results within the concurrency bound. Size the pool with handlers and other workers in mind.
 
 ## Code map
 

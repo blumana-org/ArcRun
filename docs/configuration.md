@@ -38,9 +38,9 @@ The server applies embedded database migrations before starting HTTP and workers
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WORKER_LOOP_INTERVAL_MS` | `1000` | Worker loop interval in ms |
-| `WORKER_CLAIM_TIMEOUT_SECS` | `30` | Inactivity limit for a Claimed task before requeue; waiting for a webhook permit refreshes its timestamp |
-| `WORKER_START_BATCH_SIZE` | `50` | Max successful claims per scheduler iteration; blocked candidates do not limit how far the backlog is scanned. |
+| `WORKER_LOOP_INTERVAL_MS` | `1000` | Worker polling interval in ms; the start worker also refills on completion and wakeups |
+| `WORKER_CLAIM_TIMEOUT_SECS` | `30` | Inactivity limit for a Claimed task before requeue; tasks awaiting a free start slot remain Pending |
+| `WORKER_START_BATCH_SIZE` | `50` | Max successful claims per refill, further bounded by free execution slots; blocked candidates do not limit the backlog scan. |
 | `WORKER_TIMEOUT_BATCH_SIZE` | `100` | Max timed-out Running tasks per pass. Each iteration processes at most 50 full passes. |
 | `WORKER_WEBHOOK_CONCURRENCY` | `10` | Max concurrent on_start webhook executions (startup warns when greater than or equal to `POOL_MAX_SIZE`; keep headroom for handlers and other workers) |
 | `DEAD_END_CANCEL_ENABLED` | `1` | Cancel active ancestors when none of their children remain viable |
@@ -50,10 +50,10 @@ The server applies embedded database migrations before starting HTTP and workers
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WEBHOOK_DELIVERY_INTERVAL_MS` | `1000` | Interval between webhook delivery-loop iterations (outbox drain) |
-| `WEBHOOK_DELIVERY_BATCH_SIZE` | `50` | Max outbox rows claimed per delivery-loop iteration |
-| `WEBHOOK_DELIVERY_LEASE_SECS` | `210` | Lease duration in seconds. Cover queueing within a claimed batch and sequential HTTP execution; expiry can permit duplicate delivery. |
-| `WEBHOOK_DELIVERY_CONCURRENCY` | `10` | Maximum events delivered concurrently; actions within an event run sequentially. |
+| `WEBHOOK_DELIVERY_INTERVAL_MS` | `1000` | Fallback polling and database-error retry interval; results and free slots are handled without waiting for a tick |
+| `WEBHOOK_DELIVERY_BATCH_SIZE` | `50` | Max outbox rows per claim, further bounded by free execution slots |
+| `WEBHOOK_DELIVERY_LEASE_SECS` | `210` | Lease duration in seconds. Cover preparation, sequential HTTP execution and database acknowledgement; expiry can permit duplicate delivery. |
+| `WEBHOOK_DELIVERY_CONCURRENCY` | `10` | Maximum active events plus results awaiting persistence; actions within an event run sequentially. |
 | `WEBHOOK_MAX_ATTEMPTS` | `10` | Delivery attempts before an outbox row is marked `exhausted` |
 | `WEBHOOK_RETRY_BACKOFF_BASE_SECS` | `2` | Base of the exponential retry backoff (delay = base^attempt, capped) |
 | `WEBHOOK_RETRY_BACKOFF_CAP_SECS` | `300` | Cap on the retry backoff delay |

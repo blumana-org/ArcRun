@@ -76,10 +76,10 @@ Task and pool gauges refresh on `METRICS_SAMPLER_INTERVAL_SECS`. Outbox gauges a
 | Metric | Labels | Description |
 |--------|--------|-------------|
 | `worker_loop_iterations_total` | `loop` | Worker loop iterations (per loop: `start`, `timeout`, `batch_updater`, `retention`, `delivery`, `metrics_sampler`) |
-| `worker_loop_duration_seconds` | `loop` | Worker loop duration (per loop) |
+| `worker_loop_duration_seconds` | `loop` | Worker loop duration; for start/delivery, a database coordination pass, excluding the overlapping HTTP calls |
 | `worker_loop_last_iteration_timestamp_seconds` | `loop` | Unix timestamp of each loop's last iteration (liveness heartbeat) |
 | `start_loop_is_leader` | - | 1 when this process holds the scheduler leader lease, otherwise 0 |
-| `tasks_processed_per_loop` | - | Tasks processed per start-loop iteration |
+| `tasks_processed_per_loop` | - | Completed start executions collected between scheduler coordination passes |
 
 ## Database
 

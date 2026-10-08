@@ -4,6 +4,48 @@ Issu de l'audit de performance du 2026-06-11. Ce document est la référence de 
 entre les lots : il consigne les designs **et les raisons** des choix, pour ne pas
 réintroduire un problème déjà tranché.
 
+## Mise à jour du 2026-10-08 — workers bornés, résultats au fil de l'eau
+
+Les workers start/delivery remplissent leurs places libres sans attendre la fin
+d'un lot. Une place reste occupée jusqu'à la fin du traitement du résultat. Les
+claims ne dépassent pas les places libres : les tâches en attente restent Pending,
+et les événements non pris restent dans l'outbox. Cela supprime la file de Claimed
+dont seul le premier élément en attente recevait un heartbeat.
+
+Delivery persiste les résultats prêts avant de reprendre du travail, partage une
+connexion entre ces écritures et le prochain claim/préchargement, et conserve les
+résultats en cas d'erreur de pool ou SQL. Leur nombre reste borné par la concurrence.
+Les tokens protègent chaque écriture, y compris après reprise d'une lease par un
+autre worker. Un crash entre HTTP et écriture peut toujours provoquer un doublon.
+Les transactions d'admission, quotas, transitions et enqueue ne changent pas.
+
+Le premier scan du scheduler lit seulement le nombre de candidats nécessaire aux
+places libres. Si ces candidats sont bloqués, la pagination reprend avec de grandes
+pages, sans masquer les tâches éligibles plus loin dans le backlog. Les résultats
+d'exclusion de règles restent limités au scan courant.
+
+Mesure locale comparative avec PostgreSQL 18, 64 tâches, concurrence 4, limite de
+claim 8, polling 5 ms, pool de 5 connexions, profil Rust test (`opt-level=1`). Les
+temps ci-dessous sont les médianes de trois essais, de l'activation du worker à la
+persistance des 64 résultats, hors création des tâches. Les exécutables avant
+(`0447ac8`) et après sont compilés séparément puis exécutés sans compilation de
+l'app pendant la mesure. L'entrée start mesurée est celle sans élection de leader.
+
+| Scénario | Avant | Après |
+|----------|------:|------:|
+| Delivery, HTTP 1 ms | 170 ms | 164 ms |
+| Delivery, 1 HTTP de 200 ms tous les 8 événements, autres 1 ms | 1 824 ms | 552 ms |
+| Start, HTTP 1 ms | 247 ms | 178 ms |
+| Start, même mélange rapide/lent | 1 819 ms | 587 ms |
+
+Le petit écart sur delivery rapide est dans une plage où le bruit de mesure compte.
+Ces chiffres ne prédisent pas le débit en production. Les prises de connexion,
+claims et préchargements peuvent être plus fréquents qu'avec de gros lots ; le
+scheduler de production vérifie aussi sa connexion de leader avant chaque refill.
+Une base distante ou un gros préfixe de tâches bloquées demandent donc une mesure
+représentative. Le gain attendu vient surtout des places qui restent occupées en
+présence d'appels lents et de l'absence d'attente du polling entre lots.
+
 ## Contrat API cible (décisions actées)
 
 1. **Réponse API = état durable.** Quand `PATCH /task/{id}` répond 200, la transition de
@@ -266,7 +308,9 @@ Décisions actées :
 - `BATCH_CHANNEL_CAPACITY` (défaut 100) petit pour un endpoint « high-throughput » :
   à augmenter si le PUT devient un goulot.
 - Pagination OFFSET des listings : keyset si la pagination profonde devient un usage réel.
-- Découplage webhook_phase / cadence de claim dans `start_loop` : devient sans objet
-  une fois le Lot 2 livré (seuls les `on_start` restent dans la boucle, et l'attente de
-  fin de phase est une backpressure voulue vis-à-vis de `claim_timeout` — un backlog de
-  webhooks > `claim_timeout` ferait requeue des Claimed dont le webhook est encore en file).
+- Découplage des appels HTTP et du remplissage des workers : réalisé le 2026-10-08.
+  Les claims sont désormais bornés aux places disponibles, sans file de Claimed en
+  attente d'un sémaphore. Les réponses outbox sont persistées au fil de l'eau, avec
+  priorité aux résultats prêts et conservation bornée lors d'une erreur SQL/pool.
+  Les leases, tokens et transactions d'admission/transition restent dans PostgreSQL.
+  Voir [Workers](workers.md) et [Webhooks](webhooks.md) pour le comportement actuel.
