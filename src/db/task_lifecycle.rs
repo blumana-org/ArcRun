@@ -415,6 +415,18 @@ pub(crate) async fn stop_batch<'a>(
                 .get_result(conn)
                 .await?;
 
+            // All five status updates below must use the same task acquisition
+            // order as counter flushes. Locks remain held through batch progress
+            // and slot release; no task row is acquired after either of those.
+            diesel::sql_query(
+                "SELECT id FROM task
+                 WHERE batch_id=$1 AND status NOT IN ('success','failure','canceled')
+                 ORDER BY id FOR UPDATE",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(batch_id)
+            .execute(conn)
+            .await?;
+
             // Cancel Waiting tasks
             let canceled_waiting = diesel::update(
                 dsl::task.filter(

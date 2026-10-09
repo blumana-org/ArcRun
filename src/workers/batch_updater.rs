@@ -238,8 +238,8 @@ async fn final_flush_batch_data(data: &CountMap, pool: &DbPool) {
 /// filter on status — locking a terminal row is harmless and keeps the order stable;
 /// the A7 terminal guard still lives in the UPDATE itself. Should a `40P01` still slip
 /// through (e.g. crossing via a parent row not in this array), it surfaces as an `Err`
-/// here and the caller (`flush_updates`) falls back to the per-row path — a single-row
-/// UPDATE holds only one lock and cannot form a cycle, so the retry resolves.
+/// here and the caller (`flush_updates`) falls back to the per-row path. That path
+/// still acquires capacity slots, but always AFTER its task row, matching release.
 ///
 /// Two audit-A7 guards live in the SQL:
 /// * `AND task.status NOT IN ('success','failure','canceled')` — never mutate a
@@ -270,19 +270,28 @@ async fn handle_batch_with_counts(
     // A9: pre-lock the target rows in id order, then apply the UNNEST update, in one
     // transaction so the locks are held together. A `40P01` on either statement rolls
     // the whole thing back and propagates as `Err`, letting `flush_updates` recover
-    // per-row (the deadlock-free path).
+    // per-row without the multi-task acquisition cycle.
     //
     // Capacity slot maintenance (Audit 2, D1 / 7.3b): as a Running task reports progress
     // its remaining work (`capacity_charge`) shrinks, freeing capacity for new claims.
     // We push that shrink onto the `cap:` `rule_slot` counters in the SAME transaction.
-    // A9 requires slot locks BEFORE task locks and both sorted, so the cap: slot pre-lock
-    // (sorted `lock_key`) runs FIRST — matching `claim_task_with_rules` and
-    // `release_slots_for_tasks`. The overwhelmingly common flush touches no capacity task,
+    // Task rows MUST be locked before their slots, matching admission and terminal
+    // transitions. Reading stored keys after that lock also prevents a concurrent
+    // release/reclaim from changing the capacity keys behind this flush.
+    // The overwhelmingly common flush touches no capacity task,
     // so this is a single cheap SELECT that returns nothing and the later capacity
     // statement is skipped entirely.
     db_operation::run_in_transaction(conn, move |conn| {
         Box::pin(async move {
-            // 1. (A9 first) Pre-lock the cap: slots of any task in this flush that still
+            // 1. Ordered task pre-lock; the counter UPDATE retains its terminal guard.
+            diesel::sql_query(
+                "SELECT id FROM task WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE",
+            )
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&ids)
+            .execute(&mut *conn)
+            .await?;
+
+            // 2. Pre-lock the cap: slots of any task in this flush that still
             //    carries a positive charge, in sorted key order. Empty ⇒ no capacity work.
             #[derive(diesel::QueryableByName)]
             struct LockKeyRow {
@@ -296,18 +305,10 @@ async fn handle_batch_with_counts(
                      SELECT DISTINCT k FROM task, unnest(claimed_slot_keys) AS k \
                      WHERE id = ANY($1) AND capacity_charge > 0 AND k LIKE 'cap:%' \
                  ) \
-                 ORDER BY lock_key FOR UPDATE",
+                 ORDER BY lock_key COLLATE \"C\" FOR UPDATE",
             )
             .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&ids)
             .get_results(&mut *conn)
-            .await?;
-
-            // 2. Ordered task pre-lock (no status filter — locking a terminal row is harmless).
-            diesel::sql_query(
-                "SELECT id FROM task WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE",
-            )
-            .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&ids)
-            .execute(&mut *conn)
             .await?;
 
             // 3. Counter UPDATE.
@@ -326,7 +327,7 @@ async fn handle_batch_with_counts(
             .execute(&mut *conn)
             .await?;
 
-            // 4. Charge adjust + slot decrement — only when step 1 found capacity slots.
+            // 4. Charge adjust + slot decrement — only when step 2 found capacity slots.
             //    The charge is MONOTONICALLY NON-INCREASING: `LEAST(old_charge, remaining)`
             //    where remaining = expected - success - failures recomputed from the
             //    now-updated counters (step 3). A PATCH that raised expected_count mid-run
@@ -337,8 +338,7 @@ async fn handle_batch_with_counts(
             //
             //    Terminal-race safety: a task terminalized by a concurrent tx had its
             //    charge released + NULLed there, so `capacity_charge > 0` excludes it; the
-            //    step-2 task FOR UPDATE lock serializes the two txs (both also lock the
-            //    cap: slots first, in the same sorted order — no deadlock).
+            //    step-1 task lock serializes the two txs before either takes cap: slots.
             if !cap_slots.is_empty() {
                 diesel::sql_query(
                     "WITH adj AS ( \

@@ -33,7 +33,9 @@ An execution slot stays occupied through the result transaction, bounding the nu
 
 ### Concurrency and capacity reservations
 
-Rules map to canonical keys based on rule type, matcher, and metadata values. Admission locks those keys in a stable order and reserves all slots in one transaction. If any rule blocks, the whole claim rolls back.
+Rules map to canonical keys based on rule type, matcher, and metadata values. Admission first locks the candidate task, then reserves its slots in key order, matching terminal transitions and progress flushes. The task lock and first slot upsert share a statement through a materialized CTE dependency. This preserves the number of SQL round-trips and avoids a speculative task UPDATE when a rule blocks. Row locking still has a WAL/CPU cost. If any rule blocks, the whole claim rolls back.
+
+Slot-lock queries explicitly use `COLLATE "C"` to agree with Rust's byte ordering on UTF-8 databases, regardless of the database's default locale. This avoids opposite acquisition orders for keys containing accented characters or different letter cases.
 
 Concurrency rules reserve one unit. Capacity rules reserve the task's remaining work, `max(expected_count - success - failures, 0)`. Admission checks the existing capacity charge before adding the candidate, so a newly admitted task can take the total above the threshold.
 
@@ -59,6 +61,8 @@ Timeout measures inactivity. Persisted counter updates and PATCH updates refresh
 
 A flush updates counters and `last_updated`, and reduces any capacity reservations in the same transaction. Persisted counter sums are computed with wider arithmetic and clamped to `i32::MAX`.
 
+The flush locks its task rows in UUID order before reading and locking their stored capacity keys. A terminal transition therefore cannot hold a task while waiting on a slot held by that same task's flush. Batch stop and batch-rules edits also pre-lock their eligible task sets in UUID order. These rules eliminate the task/slot inversion; propagation across multiple dependency frontiers still has no single global task order.
+
 Failure handling distinguishes several cases:
 
 - Updates targeting tasks that are now terminal, absent, or archived do not change them.
@@ -74,7 +78,7 @@ The lease, retries, ordering, and receiver contract are documented in [Webhooks]
 
 ## Retention worker
 
-The retention worker always removes unused rule-slot rows. Task archiving and archive purging run only when `RETENTION_ENABLED=1`.
+The retention worker always attempts to remove unused rule-slot rows. It locks empty slots in key order with `SKIP LOCKED`; busy rows are reconsidered on a later pass, so cleanup does not wait on admission or release. Task archiving and archive purging run only when `RETENTION_ENABLED=1`.
 
 A task is eligible for archiving when it is terminal and its `ended_at` is older than `RETENTION_DAYS`. It is retained while its own notification is queued, its batch-complete notification is queued, or its batch has completion actions and is still incomplete.
 

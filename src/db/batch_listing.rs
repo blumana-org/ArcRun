@@ -282,26 +282,48 @@ pub(crate) async fn update_batch_rules<'a>(
         });
     }
 
-    // Update only tasks that have not acquired execution slots yet. Claimed/Running
-    // tasks must finish with the exact rule set whose slot keys they persisted at claim
-    // time; mutating their rules here would make the visible rules diverge from the slots
-    // they actually hold. Paused tasks are safe because only Pending tasks can be claimed.
-    let updated = diesel::update(
-        dsl::task.filter(
-            dsl::batch_id.eq(bid).and(dsl::kind.eq(task_kind)).and(
-                dsl::status
-                    .eq(StatusKind::Waiting)
-                    .or(dsl::status.eq(StatusKind::Pending))
-                    .or(dsl::status.eq(StatusKind::Paused)),
-            ),
-        ),
-    )
-    .set((
-        dsl::start_condition.eq(new_rules),
-        dsl::last_updated.eq(diesel::dsl::now),
-    ))
-    .execute(conn)
-    .await? as i64;
+    let task_kind = task_kind.to_owned();
+    super::run_in_transaction(conn, |conn| {
+        Box::pin(async move {
+            // A multi-row UPDATE alone takes locks in planner order. Pre-lock the
+            // exact eligible set in task-id order, as the progress flush does.
+            let locked_ids: Vec<uuid::Uuid> = dsl::task
+                .filter(
+                    dsl::batch_id.eq(bid).and(dsl::kind.eq(task_kind)).and(
+                        dsl::status
+                            .eq(StatusKind::Waiting)
+                            .or(dsl::status.eq(StatusKind::Pending))
+                            .or(dsl::status.eq(StatusKind::Paused)),
+                    ),
+                )
+                .select(dsl::id)
+                .order(dsl::id.asc())
+                .for_update()
+                .load(conn)
+                .await?;
 
-    Ok(updated)
+            // Claimed/Running tasks retain the rule set whose stored slot keys
+            // they own. Only update the locked set: a previously Claimed task
+            // requeued between the statements must not introduce an unordered lock.
+            let updated = diesel::update(
+                dsl::task.filter(
+                    dsl::id.eq_any(&locked_ids).and(
+                        dsl::status
+                            .eq(StatusKind::Waiting)
+                            .or(dsl::status.eq(StatusKind::Pending))
+                            .or(dsl::status.eq(StatusKind::Paused)),
+                    ),
+                ),
+            )
+            .set((
+                dsl::start_condition.eq(new_rules),
+                dsl::last_updated.eq(diesel::dsl::now),
+            ))
+            .execute(conn)
+            .await? as i64;
+
+            Ok(updated)
+        })
+    })
+    .await
 }

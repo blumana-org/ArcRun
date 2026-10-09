@@ -2,6 +2,15 @@
 
 Contexte de reprise pour la prochaine session.
 
+**Correctif du 2026-10-09, audit point 3** : ordre tâches → batch → slots,
+au lieu de slots → tâches pour le claim/flush. Le claim combine le verrou de tâche
+et le premier upsert dans une CTE ; pas d'aller-retour supplémentaire ni d'UPDATE
+spéculatif de tâche en cas de règle bloquante. Arrêt de batch et édition de règles
+préverrouillent leurs ensembles ; GC des slots trié et `SKIP LOCKED`.
+Régressions déterministes : `test_bug_audit6`. Mesures et limites : fin de
+`docs/perf-correctness-plan.md`. Les cascades gardent leur parcours par frontière ;
+aucune garantie générale d'absence de deadlock ni retry générique ajouté.
+
 ## Campagne en cours : fixes Audit 2 (depuis 2026-07-08)
 
 **Avancement au 2026-07-09** : **Lots 4 et 5 terminés** — Lot 4 (4.1 → 4.8,
@@ -24,7 +33,7 @@ porteurs de la règle comptent dans le slot. **7.3b (D1 Capacity) : FAIT**
 (2026-07-10) — Capacity sur `rule_slot` aussi : `task.capacity_charge`
 consommée au claim (upsert unifié conc+cap, garde `max_capacity <= 0`),
 rétrécie de façon monotone par le flush du batch_updater (pré-lock A9
-slots-avant-tasks), libérée par le release généralisé (`cap:` ⇒ charge
+tasks-avant-slots depuis le correctif du 2026-10-09), libérée par le release généralisé (`cap:` ⇒ charge
 stockée). Advisory + probe CTE-SUM supprimés ; divergence assumée : le
 PATCH compteur direct ne pousse pas de delta (sur-comptage conservateur,
 réconcilié au release). **Le périmètre décidé du Lot 7 (7.2 + 7.3) est

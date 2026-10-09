@@ -774,10 +774,11 @@ impl From<DbError> for ClaimTxAbort {
 /// fresh-INSERT / `used < threshold` gate matches the old `sum >= max_cap` probe;
 /// overshoot when a large candidate lands on a near-full slot is allowed, as before).
 ///
-/// The final claim UPDATE also compares the current rules with the evaluated
-/// snapshot. A concurrent batch-rules edit or status change makes it match 0 rows
-/// and rolls back ⇒ `AlreadyClaimed` (no slot consumed). No extra query or lock is
-/// needed; a later scan evaluates the updated rules.
+/// Lock the candidate task before any slot, matching terminal transitions and
+/// progress flushes. The task lock and first slot upsert share one statement, so
+/// this adds neither a round-trip nor a speculative task UPDATE on blocked claims.
+/// Both the locking read and final UPDATE compare the rules with the scheduler's
+/// snapshot. A status/rules change returns `AlreadyClaimed` without consuming slots.
 pub async fn claim_task_with_rules<'a>(
     conn: &mut Conn<'a>,
     t: &Task,
@@ -829,30 +830,70 @@ pub(crate) async fn claim_task_with_rules_detailed<'a>(
 
     let tx: Result<(), ClaimTxAbort> = conn
         .transaction(async move |conn: &mut Conn<'a>| {
-            // 1. Slot upserts (Concurrency + Capacity unified): conditional upsert per
-            //    key, in sorted order. No row returned ⇒ at limit ⇒ abort (rollback
-            //    undoes earlier increments). `$2` = increment (1 for conc:, charge for
-            //    cap:), `$3` = threshold (max_concurency / max_capacity).
+            // 1. Lock the task BEFORE the first slot. The INSERT's input depends
+            //    on the materialized, locking candidate CTE: no slot can be touched
+            //    before the task is locked and its status/rules rechecked. Do not
+            //    replace this dependency with two independent modifying CTEs.
+            //
+            //    Further slot upserts use the same sorted order. A blocked slot
+            //    rolls back all previous increments, without ever UPDATEing task.
             #[derive(diesel::QueryableByName)]
             struct SlotUsed {
                 #[diesel(sql_type = diesel::sql_types::Integer)]
                 #[allow(dead_code)]
                 used: i32,
             }
-            for (key, increment, threshold, kind) in &slots {
-                let row: Option<SlotUsed> = diesel::sql_query(
-                    "INSERT INTO rule_slot AS rs (lock_key, used) VALUES ($1, $2)
-                     ON CONFLICT (lock_key) DO UPDATE SET used = rs.used + $2
-                     WHERE rs.used < $3
-                     RETURNING used",
-                )
-                .bind::<diesel::sql_types::Text, _>(key)
-                .bind::<diesel::sql_types::Integer, _>(*increment)
-                .bind::<diesel::sql_types::Integer, _>(*threshold)
-                .get_result::<SlotUsed>(&mut *conn)
-                .await
-                .optional()?;
-                if row.is_none() {
+            #[derive(diesel::QueryableByName)]
+            struct FirstSlot {
+                #[diesel(sql_type = diesel::sql_types::Bool)]
+                eligible: bool,
+                #[diesel(sql_type = diesel::sql_types::Bool)]
+                reserved: bool,
+            }
+            for (index, (key, increment, threshold, kind)) in slots.iter().enumerate() {
+                let reserved = if index == 0 {
+                    let first: FirstSlot = diesel::sql_query(
+                        "WITH candidate AS MATERIALIZED (
+                            SELECT id FROM task
+                            WHERE id = $4 AND status = 'pending' AND start_condition = $5
+                            FOR UPDATE
+                         ), reserved AS (
+                            INSERT INTO rule_slot AS rs (lock_key, used)
+                            SELECT $1, $2 FROM candidate
+                            ON CONFLICT (lock_key) DO UPDATE SET used = rs.used + $2
+                            WHERE rs.used < $3
+                            RETURNING used
+                         )
+                         SELECT EXISTS (SELECT 1 FROM candidate) AS eligible,
+                                EXISTS (SELECT 1 FROM reserved) AS reserved",
+                    )
+                    .bind::<diesel::sql_types::Text, _>(key)
+                    .bind::<diesel::sql_types::Integer, _>(*increment)
+                    .bind::<diesel::sql_types::Integer, _>(*threshold)
+                    .bind::<diesel::sql_types::Uuid, _>(task_id)
+                    .bind::<diesel::sql_types::Jsonb, _>(expected_rules)
+                    .get_result(&mut *conn)
+                    .await?;
+                    if !first.eligible {
+                        return Err(ClaimTxAbort::AlreadyClaimed);
+                    }
+                    first.reserved
+                } else {
+                    diesel::sql_query(
+                        "INSERT INTO rule_slot AS rs (lock_key, used) VALUES ($1, $2)
+                         ON CONFLICT (lock_key) DO UPDATE SET used = rs.used + $2
+                         WHERE rs.used < $3
+                         RETURNING used",
+                    )
+                    .bind::<diesel::sql_types::Text, _>(key)
+                    .bind::<diesel::sql_types::Integer, _>(*increment)
+                    .bind::<diesel::sql_types::Integer, _>(*threshold)
+                    .get_result::<SlotUsed>(&mut *conn)
+                    .await
+                    .optional()?
+                    .is_some()
+                };
+                if !reserved {
                     let blocked = (*kind == SlotKind::Concurrency).then(|| BlockedConcurrency {
                         key: key.clone(),
                         threshold: *threshold,
@@ -942,8 +983,10 @@ pub async fn release_slots_for_tasks<'a>(
     // one key at a time in sorted order; without this, `slot_dec`'s `UPDATE … FROM`
     // acquires them in join order, and a multi-key release racing a multi-key claim
     // (or another release) could take the same two slots in opposite orders and
-    // deadlock. Locking here in `ORDER BY lock_key` makes every slot-lock acquisition
-    // in the system sorted. Held until COMMIT (caller-invariant: in-tx).
+    // deadlock. The caller already owns ALL task rows being released: this helper
+    // orders their slot locks, it does not establish a slots-before-tasks order.
+    // C collation matches Rust's BTreeMap byte order even on localized databases.
+    // No caller may acquire further task locks after this release. Held until COMMIT.
     diesel::sql_query(
         "SELECT lock_key FROM rule_slot
          WHERE lock_key IN (
@@ -951,7 +994,7 @@ pub async fn release_slots_for_tasks<'a>(
              FROM task
              WHERE id = ANY($1) AND claimed_slot_keys IS NOT NULL
          )
-         ORDER BY lock_key
+         ORDER BY lock_key COLLATE \"C\"
          FOR UPDATE",
     )
     .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(task_ids)

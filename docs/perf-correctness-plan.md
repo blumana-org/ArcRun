@@ -232,7 +232,9 @@ validation finale : 176 tests d'intégration + 30 unitaires verts) :
    `maybe_enqueue_batch_complete` verrouille la ligne `batch` (`FOR UPDATE`, statement
    séparé) AVANT le check de terminalité — la seconde transaction attend le commit de la
    première et re-vérifie sur un snapshot frais. Le verrou batch est toujours le DERNIER
-   pris dans la transaction ⇒ pas de cycle de deadlock.
+   pris dans la transaction à cette étape du projet. Depuis l'ajout des réservations,
+   l'ordre est tâches → batch → slots ; le correctif du 2026-10-09 l'aligne aussi
+   sur le claim et le flush, sans garantir un ordre global entre frontières du DAG.
    Test : `test_batch_complete_concurrent_last_two_tasks_no_lost_signal`.
 2. **Orphan-sweep de la rétention vs batch vide** : un batch vide (tout dédupe-skipped)
    n'a aucune tâche ⇒ « orphelin » dès sa création ; le cleanup pouvait supprimer sa
@@ -314,3 +316,85 @@ Décisions actées :
   priorité aux résultats prêts et conservation bornée lors d'une erreur SQL/pool.
   Les leases, tokens et transactions d'admission/transition restent dans PostgreSQL.
   Voir [Workers](workers.md) et [Webhooks](webhooks.md) pour le comportement actuel.
+
+## Correctif d'ordre des locks — 2026-10-09 (audit point 3)
+
+Le claim et le flush de compteurs prenaient les slots avant les tâches, alors que
+les sorties terminales faisaient l'inverse. Deux tests synchronisés par
+`pg_blocking_pids` reproduisent le deadlock avec le code initial : terminaison
+contre flush Capacity, et claim contre libération d'un slot partagé. Ils passent
+après le correctif (`tests/integration/test_bug_audit6.rs`).
+
+Les tâches sont maintenant verrouillées avant les slots. Le claim combine le
+verrou de tâche et le premier upsert dans une même instruction : l'INSERT lit une
+CTE `candidate AS MATERIALIZED (... FOR UPDATE)`, ce qui impose la dépendance
+d'exécution. Les autres clés restent triées. Un refus de règle n'écrit pas la
+ligne task et annule les éventuels upserts précédents. Les contrôles de statut et
+de règles restent présents. Le flush conserve ses requêtes en inversant les deux
+préverrouillages, et lit les clés/charges une fois les tâches verrouillées.
+
+`stop_batch` et l'édition de règles préverrouillent leurs ensembles en ordre UUID ;
+l'édition n'écrit que les IDs verrouillés, même si une autre tâche devient éligible
+entre les requêtes. Le requeue conserve sa sélection non bloquante `SKIP LOCKED`. Le GC des slots
+verrouille les clés triées avec `SKIP LOCKED` avant de supprimer les lignes vides,
+dans une seule instruction. Une ligne occupée attend le prochain passage du GC.
+
+Les lectures verrouillantes de slots utilisent explicitement `COLLATE "C"` pour
+correspondre à l'ordre des chaînes Rust sur les bases UTF-8. Le tri naturel d'une
+locale peut donner l'ordre opposé pour deux clés et recréer un cycle entre slots.
+Un test sous ICU exerce à la fois la libération et le flush dans cette situation.
+Voir la [documentation PostgreSQL des collations](https://www.postgresql.org/docs/18/collation.html#COLLATION-MANAGING-STANDARD).
+
+### Comparatif SQL du claim
+
+PostgreSQL 18 local dans Docker, schéma issu des migrations, 600 candidats distincts
+par scénario, 3 répétitions avec rotation de l'ordre des variantes. Les nombres
+ci-dessous sont les médianes du temps total des 600 tentatives, en millisecondes.
+Le script utilise psycopg2 et les formes SQL du claim : il ne mesure pas le débit
+HTTP, la boucle complète du scheduler ni le coût du driver Diesel. Chaque essai
+part d'une base neuve ; autovacuum est désactivé sur les deux tables pendant
+l'essai pour exposer les écritures annulées. Aucune latence réseau n'est injectée.
+
+| Scénario | Ancien ordre | UPDATE tâche d'abord | Prélock séparé | Prélock + premier upsert (retenu) |
+|---|---:|---:|---:|---:|
+| Admissions acceptées, 1 slot | 656,64 | 572,71 | 755,78 | 641,47 |
+| Capacité saturée dès le 1er slot | 427,67 | 619,29 | 592,81 | 488,96 |
+| 3 slots, dernier saturé | 719,95 | 903,38 | 902,77 | 772,40 |
+
+Le coût retenu n'est pas nul : environ +0,10 ms par tentative refusée dès le
+premier slot dans ce microbenchmark (+14 % sur ce scénario), +0,09 ms lorsque le
+troisième bloque (+7 %). Le nominal accepté est proche de l'ancien ordre ; ces
+écarts locaux ne prouvent pas un gain de débit en production. Le nombre de
+requêtes métier reste identique, contrairement au prélock séparé (+1/tentative).
+
+Pour 600 refus au premier slot, l'UPDATE anticipé produit 600 versions de tâches
+annulées et environ 613 Ko de WAL. Le prélock combiné ne produit aucune version
+de tâche annulée et environ 91 Ko de WAL, contre 58 Ko pour l'ancien ordre. Le
+verrou de ligne coûte donc encore du WAL (environ 56 octets supplémentaires par
+tentative dans ce test). Le refus sur un slot ultérieur peut toujours annuler des
+écritures de slots précédents, comme avant.
+
+Le flush conserve le même nombre de requêtes ; sa contention est déplacée vers
+les tâches avant les slots, pas supprimée. L'arrêt d'un batch ajoute une lecture
+verrouillante groupée. L'édition de règles ajoute cette lecture et une transaction
+explicite. Ces deux opérations ne sont pas incluses dans le microbenchmark.
+
+Artefacts de cette session : `/private/tmp/arcrun-claim-lock-bench.py`,
+`/private/tmp/arcrun-claim-lock-bench-results.json`. Les régressions couvrent aussi
+l'arrêt concurrent d'un batch, le GC face à une ligne occupée, et le rollback
+d'une admission dont une règle ultérieure refuse le claim.
+
+### Garanties et limite restante
+
+Statuts, propagation, capacité, compteurs de batch et outbox restent dans leurs
+transactions actuelles. Aucun verrou externe, aucun changement de schéma, aucun
+verrou global de batch n'est ajouté au chemin nominal.
+
+Le parcours de propagation reste ordonné par frontière, pas par transaction
+entière : les cycles entre tâches de plusieurs niveaux ne sont pas éliminés par
+ce correctif. Le fallback du flush par tâche est conservé. Aucun retry générique
+n'est ajouté : diesel-async 0.9.0 classe le SQLSTATE 40P01 en `Unknown` et son
+interface d'erreur masque le SQLSTATE. Reconnaître une chaîne localisée ou rejouer
+tous les `Unknown` ne constitue pas la classification voulue. Un futur retry
+devra préserver ce code et rejouer la transaction externe après rollback confirmé,
+sans rejouer aveuglément les erreurs de transport/commit ni les seuls savepoints.
