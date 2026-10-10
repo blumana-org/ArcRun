@@ -21,14 +21,40 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-/// In order to cache results and avoid too many db calls.
-/// Uses canonical slot keys plus the proven saturated threshold, so metadata and
-/// candidate-specific limits are both represented without hash collisions.
+const MAX_BLOCKED_RULE_KEYS: usize = 4096;
+const MAX_BLOCKED_RULE_KEY_BYTES: usize = 1024 * 1024;
+
+/// Negative observations for ONE scan, shared by Concurrency and Capacity.
+/// Other transactions may free slots mid-scan; a skipped candidate waits for a
+/// later scan. This cache never admits tasks and must not outlive run_claim_loop.
+#[derive(Default)]
 struct EvaluationContext {
-    /// For each canonical Concurrency slot, the greatest threshold at which the DB
-    /// proved `used >= threshold` during this iteration. A later candidate is safely
-    /// skippable only when its own threshold is <= this value.
-    ko: HashMap<String, i32>,
+    /// Exact canonical slot -> greatest threshold observed blocked in SQL.
+    /// Boxed strings retain no spare String capacity. The entry cap separately
+    /// bounds hash-table storage and allocation overhead beyond the key bytes.
+    ko: HashMap<Box<str>, i32>,
+    key_bytes: usize,
+}
+
+impl EvaluationContext {
+    fn remember(&mut self, key: String, threshold: i32) {
+        if let Some(known) = self.ko.get_mut(key.as_str()) {
+            *known = (*known).max(threshold);
+            return;
+        }
+        if self.ko.len() >= MAX_BLOCKED_RULE_KEYS
+            || key.len() > MAX_BLOCKED_RULE_KEY_BYTES - self.key_bytes
+        {
+            // At either limit, new keys use the normal transactional SQL path.
+            return;
+        }
+        self.key_bytes += key.len();
+        self.ko.insert(key.into_boxed_str(), threshold);
+    }
+
+    fn blocks(&self, key: &str, threshold: i32) -> bool {
+        self.ko.get(key).is_some_and(|known| threshold <= *known)
+    }
 }
 
 /// Outcome of `start_task_phase_a` — the connection-holding preamble of on_start
@@ -336,12 +362,12 @@ async fn claim_phase(pool: &DbPool, claim_cap: i64) -> Vec<Task> {
 ///   invert priority: a low-priority rule-free run gets counted by a higher-priority
 ///   rule-bearing task's concurrency rule).
 /// - Rule-bearing tasks are claimed one at a time via `claim_task_with_rules`, with
-///   the `ko` cache of blocked concurrency lock keys carried across pages.
+///   the bounded `ko` cache of blocked rule slots carried across pages.
 ///
 /// Early stop is gated on `claimed >= claim_cap` (we stop because we have work, not
 /// blindly). A short (incomplete) page means the backlog is exhausted -> stop.
 pub async fn run_claim_loop<'a>(conn: &mut Conn<'a>, claim_cap: i64, page_size: i64) -> Vec<Task> {
-    let mut ctx = EvaluationContext { ko: HashMap::new() };
+    let mut ctx = EvaluationContext::default();
     let mut claimed: Vec<Task> = Vec::new();
     let mut cursor: Option<db_operation::PendingCursor> = None;
     let mut pages_scanned: usize = 0;
@@ -398,10 +424,13 @@ pub async fn run_claim_loop<'a>(conn: &mut Conn<'a>, claim_cap: i64, page_size: 
                 break 'pages;
             }
 
-            // Pre-filter: if we already know a rule is blocked in this iteration,
-            // skip the DB call entirely.
-            if is_prefilter_blocked(&t, &ctx) {
-                metrics::record_concurrency_ko_cache_hit();
+            // Reuse negative observations from this scan. Live slot release may
+            // make this conservative; every new scan starts with an empty cache.
+            if let Some(rule) = prefilter_blocked_rule(&t, &ctx) {
+                match rule {
+                    Strategy::Concurency(_) => metrics::record_concurrency_ko_cache_hit(),
+                    Strategy::Capacity(_) => metrics::record_capacity_ko_cache_hit(),
+                }
                 metrics::record_task_blocked_by_concurrency();
                 log::debug!("Start worker: task {} blocked by cached rule", t.id);
                 continue;
@@ -416,17 +445,11 @@ pub async fn run_claim_loop<'a>(conn: &mut Conn<'a>, claim_cap: i64, page_size: 
                     }
                 }
                 Ok(outcome) if outcome.result == db_operation::ClaimResult::RuleBlocked => {
-                    // Cache ONLY the exact Concurrency slot whose conditional upsert
-                    // returned no row. A Capacity rejection (or another rule on a mixed
-                    // task) carries no concurrency detail and therefore cannot poison the
-                    // prefilter. Keep the greatest proven-blocked threshold: if used >= T,
-                    // candidates with threshold <= T are blocked, but a higher threshold
-                    // must still reach the DB.
-                    if let Some(blocked) = outcome.blocked_concurrency {
-                        ctx.ko
-                            .entry(blocked.key)
-                            .and_modify(|t| *t = (*t).max(blocked.threshold))
-                            .or_insert(blocked.threshold);
+                    // Only the exact slot whose upsert refused is an observation.
+                    // Other reservations on this task rolled back; invalid rule
+                    // inputs return no slot detail. Higher thresholds still use SQL.
+                    if let Some(blocked) = outcome.blocked_slot {
+                        ctx.remember(blocked.key, blocked.threshold);
                     }
                     metrics::record_task_blocked_by_concurrency();
                     log::debug!("Start worker: task {} blocked by concurrency rule", t.id);
@@ -764,21 +787,26 @@ async fn fail_started_task(
     }
 }
 
-/// Pre-filter check: if any of the task's rule+metadata lock keys were already
-/// blocked in this iteration, skip the expensive DB call. Within a single loop
-/// iteration, counts can only increase (we only claim tasks), so a blocked key
-/// stays blocked.
-fn is_prefilter_blocked(task: &Task, ctx: &EvaluationContext) -> bool {
-    let conditions = &task.start_condition.0;
-    if conditions.is_empty() {
-        return false;
+/// Return the rule whose scan-local negative observation skips this candidate.
+/// Canonical keys include metadata and rule type; threshold comparisons preserve
+/// candidate-specific limits. Slot usage CAN decrease concurrently, so skips may
+/// defer otherwise eligible work until a later scan, never authorize a claim.
+fn prefilter_blocked_rule<'t>(task: &'t Task, ctx: &EvaluationContext) -> Option<&'t Strategy> {
+    if ctx.ko.is_empty() {
+        return None;
     }
-    conditions.iter().any(|cond| match cond {
-        Strategy::Concurency(rule) => db_operation::concurrency_slot_key(rule, &task.metadata)
-            .ok()
-            .and_then(|key| ctx.ko.get(&key).copied())
-            .is_some_and(|blocked_threshold| rule.max_concurency <= blocked_threshold),
-        Strategy::Capacity(_) => false, // Can't prefilter: sum depends on live progress
+    task.start_condition.0.iter().find(|condition| {
+        let (key, threshold) = match condition {
+            Strategy::Concurency(rule) => (
+                db_operation::concurrency_slot_key(rule, &task.metadata),
+                rule.max_concurency,
+            ),
+            Strategy::Capacity(rule) => (
+                db_operation::capacity_slot_key(rule, &task.metadata),
+                rule.max_capacity,
+            ),
+        };
+        key.is_ok_and(|key| ctx.blocks(&key, threshold))
     })
 }
 
@@ -871,4 +899,67 @@ async fn start_task_phase_a<'a>(
         idempotency_key: key,
         actions,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocked_rule_cache_caps_entries_but_updates_existing_thresholds() {
+        let mut ctx = EvaluationContext::default();
+        for n in 0..MAX_BLOCKED_RULE_KEYS {
+            ctx.remember(format!("cap:{n}"), 100);
+        }
+        ctx.remember("conc:overflow".into(), 100);
+        assert_eq!(ctx.ko.len(), MAX_BLOCKED_RULE_KEYS);
+        assert!(
+            !ctx.blocks("conc:overflow", 1),
+            "uncached keys must use SQL"
+        );
+        assert!(!ctx.blocks("conc:0", 1), "rule types must not collide");
+
+        ctx.remember("cap:0".into(), 200);
+        ctx.remember("cap:0".into(), 50);
+        assert!(ctx.blocks("cap:0", 200));
+        assert!(!ctx.blocks("cap:0", 201));
+        assert_eq!(ctx.ko.len(), MAX_BLOCKED_RULE_KEYS);
+        assert_eq!(
+            ctx.key_bytes,
+            ctx.ko.keys().map(|key| key.len()).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn blocked_rule_cache_caps_key_bytes_including_utf8_and_oversized_keys() {
+        let mut ctx = EvaluationContext::default();
+        ctx.remember("é".repeat(MAX_BLOCKED_RULE_KEY_BYTES / 2 + 1), 100);
+        assert!(
+            ctx.ko.is_empty(),
+            "one oversized key must not consume the budget"
+        );
+
+        let large_key = "é".repeat((MAX_BLOCKED_RULE_KEY_BYTES - 4) / 2);
+        ctx.remember(large_key.clone(), 100);
+        ctx.remember("cap:a".into(), 100);
+        assert!(
+            !ctx.blocks("cap:a", 1),
+            "five bytes exceed the four remaining"
+        );
+        let mut spare_capacity = String::with_capacity(1024);
+        spare_capacity.push_str("four");
+        ctx.remember(spare_capacity, 100);
+        ctx.remember("x".into(), 100);
+        assert_eq!(ctx.key_bytes, MAX_BLOCKED_RULE_KEY_BYTES);
+        assert_eq!(ctx.ko.len(), 2);
+        assert!(ctx.blocks("four", 100));
+        assert!(!ctx.blocks("x", 1));
+
+        ctx.remember(large_key.clone(), 200);
+        assert!(
+            ctx.blocks(&large_key, 200),
+            "full byte budget still allows updates"
+        );
+        assert_eq!(ctx.key_bytes, MAX_BLOCKED_RULE_KEY_BYTES);
+    }
 }

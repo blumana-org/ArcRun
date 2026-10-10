@@ -2,6 +2,14 @@
 
 Contexte de reprise pour la prochaine session.
 
+**Correctif du 2026-10-10, saturation Capacity** : cache de refus SQL limité au
+scan courant, commun à Concurrency et Capacity. Clé canonique exacte + seuil,
+4 096 entrées et 1 Mio de texte de clés maximum (table de hachage en plus).
+Cache plein → SQL pour les nouvelles clés ; aucune admission par le cache.
+Décision utilisateur : priorité correctness et CPU/RAM ; admission éventuellement
+différée au scan suivant acceptée. Pas de TTL persistant ni de nouveau système de
+notifications. Voir `docs/workers.md` et les régressions `test_bug_audit7`.
+
 **Correctif du 2026-10-09, audit point 3** : ordre tâches → batch → slots,
 au lieu de slots → tâches pour le claim/flush. Le claim combine le verrou de tâche
 et le premier upsert dans une CTE ; pas d'aller-retour supplémentaire ni d'UPDATE

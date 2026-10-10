@@ -62,7 +62,8 @@ Task and pool gauges refresh on `METRICS_SAMPLER_INTERVAL_SECS`. Outbox gauges a
 | Metric | Labels | Description |
 |--------|--------|-------------|
 | `tasks_blocked_by_concurrency_total` | - | Tasks blocked by rules |
-| `concurrency_ko_cache_hits_total` | - | Claim-loop blocked-rule cache hits (skipped DB checks) |
+| `concurrency_ko_cache_hits_total` | - | Claim transactions skipped due to a cached Concurrency refusal |
+| `capacity_ko_cache_hits_total` | - | Claim transactions skipped due to a cached Capacity refusal |
 
 ## Duration
 

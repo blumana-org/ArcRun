@@ -62,6 +62,7 @@ tests/integration/     # Integration tests (testcontainers PostgreSQL)
 ## Testing
 
 - Unit tests live in source-file test modules; integration tests in `tests/integration/` (declared in `tests/integration/main.rs`), using testcontainers for PostgreSQL.
+- Integration tests default to PostgreSQL 18 in Docker. `ARCRUN_TEST_PG_URL` can point to a dedicated disposable PostgreSQL test server with `CREATE DATABASE` permission. Each test run creates a unique template/database namespace; the caller tears down an external test server after use.
 - Shared helpers in `tests/integration/common/`: `setup.rs` (`TestApp`, `setup_test_db`, `test_service!`), `state.rs` (test config/state), `builders.rs` (task JSON builders), `assertions.rs` (`setup_test_app`, `create_tasks_ok`, `succeed_task`, `fail_task`, `assert_task_status`, …).
 - Test files are one-per-feature (`test_crud.rs`, `test_propagation.rs`, `test_outbox.rs`, `test_batch_complete.rs`, …) plus bug regressions in `test_bug_audit1.rs` / `test_bug_audit2.rs`.
 - Manual testing: `bun test/test.ts dag|single|list|update <id> <status>|view <batch_id>`.

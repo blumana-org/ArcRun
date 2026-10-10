@@ -29,7 +29,7 @@ pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 /// Counter for unique database names.
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Shared PostgreSQL container + base URL.
+/// Shared PostgreSQL container (or opt-in external test server) + base URL.
 /// Initialized once for the entire test binary.
 /// A template database with all migrations applied is created during init.
 ///
@@ -43,40 +43,47 @@ static SHARED_PG: LazyLock<SharedPg> = LazyLock::new(|| {
             .expect("Failed to build runtime for shared PG setup");
 
         rt.block_on(async {
-            let container = Postgres::default()
-                .with_tag("18-alpine")
-                .start()
-                .await
-                .expect("Failed to start shared PostgreSQL container");
+            let (container, base_url) = match std::env::var("ARCRUN_TEST_PG_URL") {
+                Ok(url) => (None, url),
+                Err(std::env::VarError::NotPresent) => {
+                    let container = Postgres::default()
+                        .with_tag("18-alpine")
+                        .start()
+                        .await
+                        .expect("Failed to start shared PostgreSQL container");
 
-            // Register atexit cleanup: Rust never drops statics, so without
-            // this the container leaks after every test run.
-            let cid = container.id().to_string();
-            *CONTAINER_ID.lock().unwrap() = Some(cid);
-            unsafe { libc::atexit(cleanup_container) };
-
-            let host_port = container.get_host_port_ipv4(5432).await.unwrap();
-            let base_url = format!(
-                "postgres://postgres:postgres@127.0.0.1:{}/postgres",
-                host_port
-            );
+                    // Register atexit cleanup: statics are never dropped in Rust.
+                    *CONTAINER_ID.lock().unwrap() = Some(container.id().to_string());
+                    unsafe { libc::atexit(cleanup_container) };
+                    let host_port = container.get_host_port_ipv4(5432).await.unwrap();
+                    (
+                        Some(container),
+                        format!("postgres://postgres:postgres@127.0.0.1:{host_port}/postgres"),
+                    )
+                }
+                Err(error) => panic!("Invalid ARCRUN_TEST_PG_URL: {error}"),
+            };
+            // A unique namespace also isolates simultaneous binaries on an
+            // external test server. Never reuse or drop an existing database.
+            let template_name = format!("arcrun_test_{}", uuid::Uuid::new_v4().simple());
 
             // Create a dedicated template database and run migrations on it.
             // This avoids running migrations per-test.
             {
                 let mut conn = PgConnection::establish(&base_url)
                     .expect("Failed to connect to postgres for template setup");
-                diesel::sql_query("CREATE DATABASE test_template")
+                diesel::sql_query(format!("CREATE DATABASE {template_name}"))
                     .execute(&mut conn)
                     .expect("Failed to create test_template database");
             }
 
-            let template_url = replace_db_name(&base_url, "test_template");
+            let template_url = replace_db_name(&base_url, &template_name);
             run_migrations(&template_url);
 
             SharedPg {
                 _container: container,
                 base_url,
+                template_name,
             }
         })
     })
@@ -85,8 +92,9 @@ static SHARED_PG: LazyLock<SharedPg> = LazyLock::new(|| {
 });
 
 struct SharedPg {
-    _container: testcontainers::ContainerAsync<Postgres>,
+    _container: Option<testcontainers::ContainerAsync<Postgres>>,
     base_url: String,
+    template_name: String,
 }
 
 /// Replace only the database name (last path segment) in a PostgreSQL URL.
@@ -98,7 +106,7 @@ fn replace_db_name(url: &str, new_db: &str) -> String {
 }
 
 // SAFETY: SharedPg is only mutated during LazyLock init (single-threaded).
-// After init, only `base_url` (String, which is Sync) is read.
+// After init, only the URL and template name (Strings, which are Sync) are read.
 // `_container` is held solely to prevent drop; it is never accessed after init.
 unsafe impl Sync for SharedPg {}
 
@@ -131,15 +139,15 @@ pub async fn setup_test_db_with_pool_size(max_size: u32) -> TestApp {
 
     // Generate a unique database name
     let seq = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let db_name = format!("test_{}", seq);
+    let db_name = format!("{}_{seq}", shared.template_name);
 
     // Create the test database from the pre-migrated template (near-instant)
     {
         let mut conn = PgConnection::establish(&shared.base_url)
             .expect("Failed to connect to postgres for DB creation");
         diesel::sql_query(format!(
-            "CREATE DATABASE {} TEMPLATE test_template",
-            db_name
+            "CREATE DATABASE {} TEMPLATE {}",
+            db_name, shared.template_name
         ))
         .execute(&mut conn)
         .unwrap_or_else(|e| panic!("Failed to create database {}: {}", db_name, e));

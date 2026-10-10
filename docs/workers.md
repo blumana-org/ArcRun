@@ -45,6 +45,32 @@ Only tasks admitted through a rule key occupy that key's reservations. Matching 
 
 Counter flushes reduce capacity reservations as work completes. Direct PATCH updates do not adjust capacity reservations mid-run. A capacity charge only decreases until it is released, even if `expected_count` is later increased.
 
+### Scan-local blocked-rule cache
+
+After SQL rejects a reservation, the scheduler remembers only that exact canonical
+slot key and the greatest threshold observed blocked during this scan. This applies
+to both Concurrency and Capacity. Candidates for the same key with a threshold at
+or below the cached threshold skip the claim transaction; larger thresholds still
+reach SQL. A mixed-rule refusal never marks its other rules blocked. Invalid rule
+inputs and database errors do not populate the cache.
+
+The cache spans pages but is discarded at the end of every `run_claim_loop` call.
+It stores no tasks, admits nothing, and never changes the transactional checks or
+reservations. Other transactions can release capacity or concurrency during a scan:
+a cached refusal can therefore defer an eligible task until a later scan and affect
+the effective admission order. There is no fixed wall-clock admission deadline.
+Each new scan starts with fresh observations; polling remains the fallback for
+progress even without a wakeup.
+
+Concurrency and Capacity share a budget of **4,096 entries and 1 MiB of stored key
+text**. Keys use boxed strings so unused String capacity is not retained. Hash-table
+storage and allocation overhead are additional, bounded by the entry count. When
+either budget is reached, new keys fall back to SQL; existing entries can still
+record a higher blocked threshold. There is no cross-scan cache or per-task wait
+queue. The pending-task scan remains paginated and still visits candidates beyond
+blocked prefixes: this optimization reduces claim transactions, not the number of
+candidate rows read. Cache hits have separate Concurrency and Capacity counters.
+
 ## Timeout worker
 
 Each iteration first requeues stale Claimed tasks whose activity timestamp is older than `WORKER_CLAIM_TIMEOUT_SECS`. Requeue releases their reservations and makes them Pending again.

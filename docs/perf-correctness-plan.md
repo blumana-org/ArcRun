@@ -398,3 +398,88 @@ interface d'erreur masque le SQLSTATE. Reconnaître une chaîne localisée ou re
 tous les `Unknown` ne constitue pas la classification voulue. Un futur retry
 devra préserver ce code et rejouer la transaction externe après rollback confirmé,
 sans rejouer aveuglément les erreurs de transport/commit ni les seuls savepoints.
+
+## Cache des refus Capacity par scan — 2026-10-10
+
+Décision utilisateur : privilégier la correctness et la consommation CPU/RAM ;
+une admission différée au prochain scan est acceptable. Le cache Concurrency
+existant couvre désormais aussi Capacity, avec un budget partagé de 4 096 entrées
+et 1 Mio de texte de clés. La table de hachage et les allocations s'ajoutent à ce
+budget de texte, avec une taille bornée par le nombre d'entrées. Les clés stockées
+sont des `Box<str>` ; aucune tâche ni capacité excédentaire de `String` n'est retenue.
+Une nouvelle clé qui dépasse un budget continue à passer par SQL.
+
+Seul le slot dont l'upsert a effectivement refusé est mémorisé, avec le seuil
+observé. Un candidat de même clé et de seuil inférieur ou égal peut être écarté
+pour ce scan ; un seuil supérieur passe encore par SQL. Les autres règles d'une
+tâche mixte, les entrées invalides et les erreurs SQL n'alimentent pas le cache.
+Les clés canoniques distinguent le type de règle, le matcher et les valeurs de
+métadonnées. Chaque scan repart avec un cache vide.
+
+L'admission conserve les mêmes requêtes et garanties transactionnelles, notamment
+le contrôle `used < threshold` avant d'ajouter la charge du candidat (dépassement
+autorisé du seuil inchangé). Une libération concurrente peut rendre une observation
+négative périmée : la tâche reste alors Pending jusqu'à un scan ultérieur. Cela
+peut modifier l'ordre effectif des départs ; aucune échéance murale n'est garantie.
+Il n'y a ni TTL persistant, ni nouveau système de réveil, ni dépendance externe.
+
+### Mesures du scheduler
+
+Benchmark reproductible ignoré par défaut :
+`test_bug_audit7::benchmark_capacity_cache_scans`. Il appelle le vrai
+`run_claim_loop`, avec Diesel, décodage des tâches et pages de 500 candidats.
+Les slots saturés ont des tâches Running portant leurs réservations ; les
+candidats et leurs seuils sont identiques entre versions. Création des données,
+élection de leader, appels HTTP et autres workers exclus de la mesure.
+Le nombre de transactions/requêtes vient de l'instrumentation de la connexion.
+Le CPU est le temps utilisateur + système du **processus Rust**, via `getrusage`,
+et non le CPU PostgreSQL ou celui de toute l'application en production.
+
+PostgreSQL 17.11 local, macOS ARM64, profil test Rust (`opt-level=1`), ancien code
+`cdeb8a1` contre le cache. Chaque essai utilise une base neuve. Une première paire
+avant/après était très perturbée par la charge de la machine, y compris sur les
+cas témoins ; elle ne permet pas d'attribuer les écarts CPU au correctif. Une
+seconde paire inverse l'ordre des versions, sans compilation ni autre test de
+cette session en parallèle. Voici ses médianes de trois essais par cas :
+
+| Scénario | Transactions avant → après | Temps du scan avant → après | CPU Rust avant → après |
+|---|---:|---:|---:|
+| 10 000 refus, 1 clé | 10 000 → 1 | 1 937,79 → 61,15 ms | 579,68 → 36,50 ms |
+| 10 000 refus, 100 clés | 10 000 → 100 | 3 457,40 → 86,44 ms | 834,82 → 40,86 ms |
+| 2 000 refus, 2 000 clés distinctes | 2 000 → 2 000 | 437,70 → 381,41 ms | 116,69 → 118,20 ms |
+| 1 000 admissions acceptées, clés distinctes | 1 000 → 1 000 | 286,02 → 297,62 ms | 72,48 → 78,24 ms |
+
+Le premier cas évite 99,99 % des transactions et mesure environ 94 % de CPU Rust
+en moins par scan. Les requêtes observées, BEGIN/ROLLBACK compris, passent de
+30 021 à 24 (les lectures paginées demeurent). À 100 clés, elles passent à 321 ;
+les temps avant restent variables sur ce cas (577 à 1 203 ms de CPU). Les comptes
+de transactions sont identiques dans tous les essais, y compris la première paire.
+
+Sans partage de clés, aucun gain SQL : le CPU des refus uniques augmente d'environ
+1 % dans cette seconde paire. Le témoin accepté mesure environ +8 % de CPU
+(5,76 ms sur 1 000 admissions) et +4 % de temps écoulé ; aucune requête n'est ajoutée.
+Ces petits écarts et les temps absolus restent sensibles à la machine. On ne
+déduit pas de ces mesures un pourcentage de gain CPU global en production.
+La fréquence effective des scans peut aussi augmenter lorsque chaque scan finit
+plus vite. Le scan des candidats reste O(N) ; ce cache ne supprime pas les lectures
+ni le décodage des lignes et n'établit aucune baisse du RSS.
+
+Résultats bruts des deux paires :
+`/private/tmp/arcrun-capacity-benchmark-results.json`. Reproduction :
+`cargo test --test integration benchmark_capacity_cache_scans -- --ignored --nocapture --test-threads=1`.
+`ARCRUN_TEST_PG_URL` permet d'utiliser un serveur PostgreSQL de test jetable au lieu
+du conteneur par défaut ; chaque exécution crée ses propres bases et son template.
+
+### Validation
+
+61 tests unitaires, 310 tests d'intégration et 5 doctests passent ; Clippy workspace
+strict (`--all-targets --all-features -- -D warnings`) et formatage passent aussi.
+Les six nouvelles régressions couvrent les budgets d'entrées/octets (dont UTF-8),
+les seuils, les règles mixtes, les refus de validation/erreurs SQL, le passage des
+pages et le réexamen après un flush libérant de la capacité. Le test de saturation
+reproduit 41 transactions sur l'ancien scheduler et en vérifie 2 avec le cache.
+
+Docker étant indisponible, les intégrations de cette session utilisent PostgreSQL
+17.11 avec ICU ; le backend de test Docker reste PostgreSQL 18 par défaut. Après
+une interruption par manque d'espace disque, les 310 intégrations ont été rejouées
+avec succès par groupes, en nettoyant leurs bases temporaires entre groupes.

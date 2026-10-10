@@ -325,6 +325,11 @@ register_int_counter!(
     "concurrency_ko_cache_hits_total",
     "Times the claim loop's blocked-rule (ko) cache let it skip a concurrency DB check"
 );
+register_int_counter!(
+    CAPACITY_KO_CACHE_HITS_TOTAL,
+    "capacity_ko_cache_hits_total",
+    "Times the claim loop's blocked-rule cache skipped a claim due to Capacity"
+);
 
 // ============================================================================
 // Business / Batch & Claim Metrics (Lot M4)
@@ -641,6 +646,10 @@ pub fn record_concurrency_ko_cache_hit() {
     CONCURRENCY_KO_CACHE_HITS_TOTAL.inc();
 }
 
+pub fn record_capacity_ko_cache_hit() {
+    CAPACITY_KO_CACHE_HITS_TOTAL.inc();
+}
+
 pub fn record_task_deduped() {
     TASKS_DEDUPED_TOTAL.inc();
 }
@@ -828,6 +837,7 @@ pub fn init_metrics() {
     let _ = &*START_LOOP_IS_LEADER;
     let _ = &*TASKS_BLOCKED_BY_CONCURRENCY;
     let _ = &*CONCURRENCY_KO_CACHE_HITS_TOTAL;
+    let _ = &*CAPACITY_KO_CACHE_HITS_TOTAL;
     let _ = &*TASKS_DEDUPED_TOTAL;
     let _ = &*BATCH_INSERT_TASKS;
     let _ = &*BATCHES_COMPLETED_TOTAL;
