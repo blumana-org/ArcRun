@@ -658,8 +658,92 @@ Trois régressions dans `test_bug_audit9` :
 Ces mesures vérifient les allers-retours, pas un pourcentage de gain CPU/RAM ou
 de débit HTTP. Serveur de validation jetable : PostgreSQL 17.11 local ; artefacts
 dans `/private/tmp/arcrun-dedupe-ug3vnb96/` (`before-tests.log`, `after-targeted.log`,
-`integration.log`). Le point 5 initial, coût du listing des batches, reste ouvert.
+`integration.log`). Le point 5 initial restait ouvert à ce stade ; voir ci-dessous.
 
 Validation finale : **61 tests unitaires + 321 intégrations + 5 doctests = 387
 tests passés**, Clippy workspace strict (`--all-targets --all-features -- -D warnings`)
 et formatage propres. Les 321 bases de la dernière suite totalisent **0 deadlock**.
+
+## Listing des batches : agrégations après pagination — 2026-10-11
+
+Le point 5 est traité par une réécriture SQL conservant le modèle et les résultats.
+La CTE de sélection ne groupe plus que `batch_id` et `MIN(created_at)` parmi les
+tâches correspondant aux filtres. `ARRAY_AGG(DISTINCT kind)` ne travaille plus sur
+tous les batches avant LIMIT, et scope/metadata/remaining sortent des clés de
+regroupement. Deux agrégations LATERAL lisent ensuite les tâches de chaque batch
+de la page : kinds filtrés d'une part, comptes par statut et dates non filtrés
+d'autre part. La ligne batch optionnelle est rattachée après les agrégations.
+Sans filtre batch, les plans personnalisés mesurés éliminent aussi la jointure
+batch dans la sélection initiale ; les metadata sont lues uniquement pour la page.
+
+Invariants conservés :
+
+- Tous les filtres de tâche doivent correspondre à une même ligne. Les caractères
+  `%` et `_` restent littéraux dans les filtres de sous-chaîne.
+- Kinds = tâches filtrées ; comptes et dates affichés = toutes les tâches encore
+  dans `task`. Aucun retour des archives dans le listing.
+- Classement sur la première date **filtrée**, qui peut différer de la date
+  affichée. Le comportement existant des égalités UUID reste inchangé : DESC
+  pour sélectionner la page, ASC pour restituer les égalités dans cette page.
+- Les batches sans ligne `batch` restent visibles avec remaining NULL. Une ligne
+  batch vide ne suffit pas à apparaître ; la rétention peut déplacer les dates
+  minimales d'un batch partiellement archivé et retirer un batch entièrement archivé.
+- Une seule requête et un seul snapshot pour sélection et détails. Aucun nouveau
+  compteur, index, verrou de ligne, écriture ni aller-retour applicatif.
+
+**Coûts et limites.** La sélection visite toujours les tâches correspondantes à
+travers la table chaude et groupe leurs batches avant LIMIT/OFFSET. Cette étape
+reste dépendante de l'historique ; ce n'est pas une pagination en coût constant.
+Les tâches des batches sélectionnés sont lues deux fois, avec l'index existant
+`idx_task_batch_id`, et les filtres de tâche sont réévalués pour les kinds.
+Ce travail supplémentaire est mesurable sur les très petites tables. Les plans
+peuvent choisir une agrégation par hachage : le gain CPU n'implique pas une baisse
+universelle de chaque allocation mémoire. Aucun coût n'est ajouté aux transitions
+transactionnelles. Le pivot Rust et les données retournées sont inchangés.
+
+**Mesures locales**, PostgreSQL 17.11, schéma réel migré, données chaudes, page de
+50 batches, sans filtre, metadata synthétiques d'environ 0,8 Kio quand présentes.
+CPU = temps utilisateur + système du backend (`log_statement_stats`), médiane de
+7 passages alternés avant/après, connexion fraîche pour chaque passage, plans
+personnalisés et parallélisme désactivé pour mesurer tout le CPU dans ce backend.
+Les connexions, le chargement et ANALYZE ne font pas partie du CPU de la requête.
+
+| Jeu | Tâches | CPU avant → après / requête | Pic RSS backend avant → après |
+|-----|--------|----------------------------|-------------------------------|
+| 20 000 batches × 10, metadata | 200 000 | 259,9 → 28,0 ms (−89 %) | 103,4 → 69,5 Mio |
+| 200 batches × 1 000, metadata | 200 000 | 307,2 → 36,1 ms (−88 %) | 73,2 → 65,4 Mio |
+| 20 000 batches × 10, sans ligne batch | 200 000 | 101,4 → 27,0 ms (−73 %) | 68,0 → 67,8 Mio |
+| 10 batches × 20 000, metadata (stress) | 200 000 | 641,7 → 70,1 ms (−89 %) | 89,5 → 67,8 Mio |
+| 50 batches × 1, sans ligne batch | 50 | 0,57 → 0,89 ms | 13,3 → 13,4 Mio |
+| 50 batches × 1, metadata | 50 | 0,75 → 1,01 ms | 14,0 → 13,8 Mio |
+
+Le RSS inclut les pages partagées mappées : ce n'est ni la mémoire privée de la
+requête ni la RAM totale de PostgreSQL. Les plans montrent notamment une table
+de hachage d'environ 2 Mio sur les 20 000 batches, alors que certains anciens
+plans triaient par petits groupes. Sur le jeu de petits batches avec metadata,
+les écritures temporaires du plan passent d'environ 16 Mio à zéro ; sur les
+10 batches géants, d'environ 154 Mio à zéro. Les volumes lus dans les buffers
+peuvent augmenter lorsque la page couvre presque toutes les tâches.
+
+Une passe séparée EXPLAIN ANALYZE, avec parallélisme normal, confirme la réduction
+du temps SQL sur ces quatre grands jeux (médianes de 5 passages). Les plans
+génériques forcés sont aussi plus rapides sur les quatre jeux, mais restent
+sensiblement plus coûteux sur certains cas ; aucun réglage global du planificateur
+n'est changé. Les valeurs ne prédisent pas un gain identique en production, ni le
+débit HTTP ou le CPU Rust, qui n'ont pas été mesurés ici.
+
+**Validation.** Quatre régressions `test_bug_audit10` couvrent filtres combinés et
+dates inclusives, pagination/classement, identité optionnelle et rétention, puis
+le volume d'entrée des agrégations portant les kinds dans le plan réellement
+exécuté par la route. Ce dernier test échoue sur l'ancienne requête (3 624 entrées
+dans les agrégations pour une page de 24 tâches) et passe après correction. Les
+trois tests de résultats passent sur les deux versions. Le benchmark compare
+aussi les résultats des deux SQL sur 13 combinaisons de filtres/pagination,
+6 jeux et 2 modes de plan : **156 comparaisons équivalentes**.
+
+Validation finale : **61 unitaires + 325 intégrations + 5 doctests = 391 tests
+passés**, deux benchmarks manuels ignorés, Clippy workspace strict et formatage
+propres. Les 325 bases de la dernière suite totalisent **0 deadlock**.
+Artefacts reproductibles dans `/private/tmp/arcrun-listing-cl958fzf/` :
+`bench.py`, `before.sql`, `after.sql`, `results.json`, `profile-results.json`, plans
+JSON, `before-regressions.log`, `integration.log`, `clippy.log`.

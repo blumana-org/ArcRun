@@ -43,9 +43,11 @@ struct BatchStatusRow {
 
 /// List batches with aggregated statistics, supporting optional filters and pagination.
 ///
-/// Uses `GROUP BY (batch_id, status)` instead of repeated `COUNT(*) FILTER`
-/// clauses — the pivot into per-status counts happens in Rust. A `LEFT JOIN batch`
-/// surfaces the batch scope/metadata (NULL for batches that have no `batch` row).
+/// Page selection groups only batch IDs and the first matching task's timestamp.
+/// Kinds and per-status statistics are then aggregated only for that page, before
+/// attaching batch metadata. Kinds use the task filters; statistics use all hot
+/// tasks. One statement keeps both views on the same snapshot. The status pivot
+/// stays in Rust, and batches without a persisted `batch` row remain visible.
 /// All filter parameters are always bound as `Nullable` ($1–$8), so no dynamic
 /// SQL assembly or bind-count branching is needed.
 pub(crate) async fn list_batches<'a>(
@@ -72,11 +74,7 @@ pub(crate) async fn list_batches<'a>(
         WITH paginated_batches AS (
             SELECT
                 t.batch_id,
-                ARRAY_AGG(DISTINCT t.kind) AS kinds,
-                MIN(t.created_at) AS first_created,
-                b.scope AS scope,
-                b.metadata AS metadata,
-                b.remaining AS remaining
+                MIN(t.created_at) AS first_created
             FROM task t
             LEFT JOIN batch b ON b.id = t.batch_id
             WHERE t.batch_id IS NOT NULL
@@ -90,24 +88,43 @@ pub(crate) async fn list_batches<'a>(
               AND ($8::text        IS NULL
                    OR b.scope ILIKE '%' || $8 || '%'
                    OR b.metadata::text ILIKE '%' || $8 || '%')
-            GROUP BY t.batch_id, b.scope, b.metadata, b.remaining
+            GROUP BY t.batch_id
             ORDER BY first_created DESC, t.batch_id DESC
             LIMIT $9 OFFSET $10
         )
         SELECT
-            t.batch_id,
-            t.status::text AS status_text,
-            COUNT(*)::bigint AS cnt,
-            MIN(t.created_at) AS first_created_at,
-            MAX(t.last_updated) AS latest_updated_at,
-            pb.kinds,
-            pb.scope,
-            pb.metadata,
-            pb.remaining
-        FROM task t
-        INNER JOIN paginated_batches pb ON t.batch_id = pb.batch_id
-        GROUP BY t.batch_id, t.status, pb.kinds, pb.first_created, pb.scope, pb.metadata, pb.remaining
-        ORDER BY pb.first_created DESC, t.batch_id
+            pb.batch_id,
+            stats.status_text,
+            stats.cnt,
+            stats.first_created_at,
+            stats.latest_updated_at,
+            matched.kinds,
+            b.scope,
+            b.metadata,
+            b.remaining
+        FROM paginated_batches pb
+        CROSS JOIN LATERAL (
+            SELECT ARRAY_AGG(DISTINCT t.kind) AS kinds
+            FROM task t
+            WHERE t.batch_id = pb.batch_id
+              AND ($1::text        IS NULL OR t.kind       LIKE '%' || $1 || '%')
+              AND ($2::status_kind IS NULL OR t.status     = $2)
+              AND ($3::text        IS NULL OR t.name       LIKE '%' || $3 || '%')
+              AND ($4::timestamptz IS NULL OR t.created_at >= $4)
+              AND ($5::timestamptz IS NULL OR t.created_at <= $5)
+        ) matched
+        CROSS JOIN LATERAL (
+            SELECT
+                t.status::text AS status_text,
+                COUNT(*)::bigint AS cnt,
+                MIN(t.created_at) AS first_created_at,
+                MAX(t.last_updated) AS latest_updated_at
+            FROM task t
+            WHERE t.batch_id = pb.batch_id
+            GROUP BY t.status
+        ) stats
+        LEFT JOIN batch b ON b.id = pb.batch_id
+        ORDER BY pb.first_created DESC, pb.batch_id
         "#,
     )
     .bind::<sql_types::Nullable<sql_types::Text>, _>(kind_filter)

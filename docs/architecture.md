@@ -103,6 +103,8 @@ Retention moves eligible terminal tasks into `task_archive`. `GET /task/{id}` fa
 
 Archiving waits for pending task notifications and batch-completion requirements. This preserves the records needed to compute the final batch payload. An optional archive-retention period eventually deletes archived records; its default of zero keeps them indefinitely.
 
+`GET /batches` selects its page by grouping only batch IDs and the earliest matching task timestamps. It then aggregates matching kinds and all-task status counts/dates for each selected batch using the existing task batch index, and attaches the optional batch metadata outside the aggregates. These reads share one SQL statement and snapshot; no listing counters or additional write locks are introduced. Page selection still visits matching tasks across the hot table, so this reduces aggregation cost without making listing cost independent of total history. The two page-local aggregations read selected tasks separately.
+
 ## Connections and failure handling
 
 API handlers acquire connections through retry and circuit-breaker logic. The breaker rejects acquisition while open, probes recovery after a delay, and closes after enough successful probes. Health and readiness endpoints use a separate two-second acquisition bound.

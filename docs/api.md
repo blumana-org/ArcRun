@@ -262,7 +262,7 @@ Returns `200` with batch summaries containing `batch_id`, `total_tasks`, creatio
 | `metadata` | Batch metadata JSON containment |
 | `search` | Substring across batch scope and metadata text |
 
-Filters combine with AND. Task filters select batches containing a matching task. Counts and timestamps describe all current tasks in each selected batch; `kinds` is collected from the tasks matching the filters. URL-encode JSON and timestamp query values.
+Filters combine with AND. All task filters must match the same task for its batch to qualify. Counts and timestamps describe all current tasks in each selected batch; `kinds` is collected from the tasks matching the filters. Batches are ranked by the earliest creation time among their matching tasks, newest first; this can differ from the displayed `first_created_at` when filters are present. URL-encode JSON and timestamp query values.
 
 `remaining` counts non-terminal tasks for batches with a persisted batch record. It is null when no completion actions, scope, or metadata were supplied at creation.
 

@@ -13,6 +13,7 @@ mod test_batch_scope;
 mod test_batch_stats;
 mod test_batch_update;
 mod test_bug_audit1;
+mod test_bug_audit10;
 mod test_bug_audit2;
 mod test_bug_audit3;
 mod test_bug_audit4;

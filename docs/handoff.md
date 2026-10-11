@@ -2,6 +2,16 @@
 
 Contexte de reprise pour la prochaine session.
 
+**Correctif du 2026-10-11, audit point 5** : le listing des batches pagine sur
+`batch_id` + date minimale filtrée, puis calcule les kinds et statistiques de
+la page. Les metadata ne participent plus aux regroupements. Même requête et
+snapshot, mêmes filtres, classement et résultats ; aucun index, compteur ou
+verrou d'écriture ajouté. Quatre régressions dans `test_bug_audit10` couvrent
+filtres combinés, pagination, rétention et volume réellement agrégé. Le test
+de volume échoue sur l'ancienne requête. La sélection de page reste globale :
+ce correctif réduit son coût sans supprimer la dépendance au volume de tâches.
+Mesures et compromis : fin de `docs/perf-correctness-plan.md`.
+
 **Correctif du 2026-10-11, dedupe multi-clés** : l'insertion collecte toutes les
 clés advisory applicables du batch, les trie/déduplique et les acquiert en une
 requête avant les premières écritures de tâches. Les checks et insertions gardent
@@ -9,7 +19,7 @@ l'ordre d'entrée. Aucun verrou pour les matchers aux champs absents ; aucun SQL
 supplémentaire pour les batches sans dedupe. Régressions `test_bug_audit9` : cycle
 entre batches d'ordres opposés, ordre d'insertion/dépendances et nombre de requêtes,
 matchers inapplicables. Le scénario concurrent reproduit un deadlock sur l'ancien
-code. Le point 5 de l'audit initial (coût du listing des batches) reste ouvert.
+code. Le point 5 de l'audit initial est traité par le correctif ci-dessus.
 
 **Correctif du 2026-10-11, audit point 3 (suite)** : les transitions terminales
 préverrouillent leur ensemble descendant complet en ordre UUID avant l'écriture
