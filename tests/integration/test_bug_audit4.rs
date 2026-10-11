@@ -107,6 +107,15 @@ async fn test_bug1_timeout_rechecks_activity_after_scan() {
         .unwrap();
     }
 
+    // Gate the batch-counter write AFTER the first timeout's task locks. A busy
+    // task now defers the entire timeout instead of blocking propagation, so it
+    // cannot be used as the scheduling barrier for this stale-scan regression.
+    {
+        let mut conn = state.pool.get().await.unwrap();
+        diesel::sql_query("INSERT INTO batch(id,on_complete,remaining) SELECT batch_id,'[]'::jsonb,4 FROM task WHERE id=$1")
+            .bind::<diesel::sql_types::Uuid, _>(parent).execute(&mut conn).await.unwrap();
+    }
+
     let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let pool = state.pool.clone();
@@ -114,8 +123,8 @@ async fn test_bug1_timeout_rechecks_activity_after_scan() {
         let mut conn = pool.get().await.unwrap();
         arcrun::db_operation::run_in_transaction(&mut conn, |conn| {
             Box::pin(async move {
-                diesel::sql_query("SELECT id FROM task WHERE id=$1 FOR UPDATE")
-                    .bind::<diesel::sql_types::Uuid, _>(child)
+                diesel::sql_query("SELECT id FROM batch WHERE id=(SELECT batch_id FROM task WHERE id=$1) FOR UPDATE")
+                    .bind::<diesel::sql_types::Uuid, _>(parent)
                     .execute(conn)
                     .await?;
                 let pid: BackendPid = diesel::sql_query("SELECT pg_backend_pid() AS pid")
@@ -142,7 +151,7 @@ async fn test_bug1_timeout_rechecks_activity_after_scan() {
         arcrun::workers::WorkerNudges::new(),
     ));
 
-    // The worker scanned both candidates, then blocked propagating the first.
+    // The worker scanned both candidates, then blocked persisting the first batch decrement.
     wait_for_blocked(&state.pool, pid).await;
     let request = actix_web::test::TestRequest::patch()
         .uri(&format!("/task/{active}"))

@@ -82,55 +82,24 @@ pub(crate) async fn find_timed_out_tasks<'a>(
     Ok(ids)
 }
 
-/// Atomically mark a single task as timed-out (Failed) and propagate to children,
-/// all within one transaction. Returns the failed task, cascade-failed child IDs,
-/// and any ancestors canceled by dead-end detection.
-/// Uses FOR UPDATE SKIP LOCKED to avoid conflicts with concurrent workers.
-pub(crate) async fn timeout_task_and_propagate<'a>(
-    conn: &mut Conn<'a>,
+/// One atomic timeout attempt with nonblocking task-lock acquisition. The whole
+/// possible cascade must be locked, otherwise the task is deferred without writes.
+/// Root inactivity is rechecked on the locked version. Batch/slot writes may wait.
+pub async fn timeout_task_and_propagate(
+    conn: &mut Conn<'_>,
     task_id: uuid::Uuid,
     dead_end_enabled: bool,
-) -> Result<
-    Option<(
-        Task,
-        Vec<uuid::Uuid>,
-        Vec<crate::workers::propagation::CanceledAncestor>,
-    )>,
-    DbError,
-> {
-    use super::run_in_transaction;
-    use {
-        crate::schema::task::dsl::*,
-        diesel::{dsl::now, pg::data_types::PgInterval},
-    };
+) -> Result<bool, DbError> {
+    use super::{Transition, prepare_transition, run_in_transaction};
+    use crate::schema::task::dsl::*;
+    use diesel::dsl::now;
     const TIMEOUT_REASON: &str = "Timeout";
 
     run_in_transaction(conn, |conn| {
         Box::pin(async move {
-            // The scan is only a candidate list: progress may have committed since
-            // then. Recheck inactivity in the locking query, without an extra read.
-            // SKIP LOCKED also lets an in-flight progress update finish first.
-            let t: Option<Task> = task
-                .filter(
-                    id.eq(task_id)
-                        .and(status.eq(models::StatusKind::Running))
-                        .and(started_at.is_not_null())
-                        .and(
-                            last_updated.lt(now.into_sql::<sql_types::Timestamptz>()
-                                - (PgInterval::from_microseconds(1_000_000)
-                                    .into_sql::<sql_types::Interval>()
-                                    * timeout)),
-                        ),
-                )
-                .for_update()
-                .skip_locked()
-                .first::<Task>(conn)
-                .await
-                .optional()?;
-
-            let Some(t) = t else {
-                // No longer overdue, already transitioned, or currently locked.
-                return Ok(None);
+            let Some(prepared) = prepare_transition(conn, task_id, Transition::Timeout).await?
+            else {
+                return Ok(false);
             };
 
             // Mark as failed (last_updated intentionally NOT updated —
@@ -145,9 +114,13 @@ pub(crate) async fn timeout_task_and_propagate<'a>(
                 .await?;
 
             // Propagate failure to children (inside tx)
-            let cascade_failed =
-                crate::workers::propagate_to_children(&task_id, &models::StatusKind::Failure, conn)
-                    .await?;
+            let cascade_failed = crate::workers::propagate_to_children(
+                &task_id,
+                &models::StatusKind::Failure,
+                prepared.children,
+                conn,
+            )
+            .await?;
 
             // Dead-end ancestor cancellation (inside tx)
             let canceled_ancestors = if dead_end_enabled {
@@ -186,7 +159,7 @@ pub(crate) async fn timeout_task_and_propagate<'a>(
             // were Waiting/Paused ⇒ NULL keys ⇒ no-op.
             crate::db_operation::release_slots_for_tasks(conn, &terminal_ids).await?;
 
-            Ok(Some((t, cascade_failed, canceled_ancestors)))
+            Ok(true)
         })
     })
     .await

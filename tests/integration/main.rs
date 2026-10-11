@@ -19,6 +19,7 @@ mod test_bug_audit4;
 mod test_bug_audit5;
 mod test_bug_audit6;
 mod test_bug_audit7;
+mod test_bug_audit8;
 mod test_cancel_webhook;
 mod test_capacity_slot;
 mod test_claim_loop;

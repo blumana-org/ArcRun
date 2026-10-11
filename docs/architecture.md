@@ -50,6 +50,12 @@ Each task stores counts of outstanding dependencies. A parent reaching a termina
 
 Failure propagation processes the graph one level at a time. Guarded updates ensure that a child reached through several paths is terminalized once. All resulting state changes and notifications belong to the originating transaction.
 
+Before a terminal transition writes anything, `prepare_transition` reads the root's eligibility and direct links. A leaf completion needs only its guarded root UPDATE. Otherwise, one SQL statement locks the whole possible downward write set in UUID order: root plus direct children for success; the nonterminal closure through required-success edges plus one hop of all children for failure/cancellation/timeout. The original direct-link read is reused by propagation, whose per-frontier lock queries are removed.
+
+This set is conservative: terminal states cannot be reopened and edges cannot be added to a committed graph. Eligibility is checked again after locking. Already-terminal PATCH requests avoid traversing or locking descendants. An aggregate consumes the complete locking CTE and returns only the root status; the closure stays in PostgreSQL, where its traversal, materialization and sort still cost CPU and memory. The Rust frontier walk and its accumulated failed IDs remain unchanged.
+
+All blocking task locks precede batch and reservation locks. Dead-end ancestor acquisition remains nonblocking (`SKIP LOCKED`), before batch/slot writes. Flushes, batch stop, rule edits and rule-free batch claims follow the same global task order; retention only processes its nonblocking locked subset. No batch-wide mutex or generic transaction retry is added. Multi-key deduplication advisory locks during insertion remain a separate ordering limitation.
+
 Paused tasks still receive dependency-counter updates and can fail because a required parent failed. A paused task whose dependencies are satisfied stays Paused until explicitly resumed.
 
 When enabled, dead-end cancellation also walks upward: a non-terminal ancestor whose children are all terminal can be canceled. `dead_end_barrier` stops further traversal above that task. See [task lifecycle](concepts.md#task-lifecycle).

@@ -6,7 +6,7 @@ use crate::{
     Conn,
     db_operation::{self, DbError},
     metrics,
-    models::{StatusKind, Task},
+    models::StatusKind,
 };
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -40,35 +40,17 @@ use super::webhooks::{
 /// task whose counters reach 0 remains `Paused` (only an explicit resume moves it
 /// out of `Paused`).
 ///
-/// **Deadlock avoidance (Audit 2, A9)**: the batched `UPDATE … WHERE id = ANY(...)`
-/// statements below lock rows in the query planner's chosen order, not the array
-/// order. Two propagations of parents that share children (a "diamond" DAG) — or a
-/// propagation crossing the batch-updater flush — could therefore acquire the same
-/// child locks in opposite orders and deadlock (Postgres `40P01`), surfacing as a
-/// 500 on the PATCH. To give every propagation a single, canonical acquisition
-/// order, this function **pre-locks the whole level's child set once** with a
-/// `SELECT id … WHERE id = ANY(...) ORDER BY id FOR UPDATE` before any UPDATE. Since
-/// `propagate_to_children` always runs inside a transaction (caller invariant), the
-/// locks are held until COMMIT, so two concurrent diamond propagations now queue on
-/// the same globally-ordered locks instead of cycling. The pre-lock deliberately
-/// does NOT filter on status (locking an already-terminal child row is harmless —
-/// the status-guarded UPDATEs below simply won't match it), so the ordering is
-/// stable regardless of how far each child has progressed.
-///
-/// **Assumed residual**: the failure cascade (each level of
-/// `cascade_failure_frontier` locks its own child set in a nested acquisition,
-/// after the previous level's locks) and a flush-vs-propagation crossing *through
-/// the parent row* remain theoretically possible, as there is no single
-/// acquisition order spanning levels. Those are left
-/// to Postgres's deadlock detector + the batch-updater's per-row fallback (see
-/// `handle_batch_with_counts`); no generic `40P01` retry is added here (A9 decision).
-#[tracing::instrument(name = "propagate_to_children", level = "debug", skip(conn), fields(parent_id = %parent_id, status = ?result_status))]
+/// The caller must pre-lock the entire possible downward write set with
+/// `prepare_transition` before changing the root. Per-frontier ordering alone can
+/// still deadlock across levels. This walk performs only guarded updates of rows
+/// already held by the transaction. Dead-end ancestors remain nonblocking.
+#[tracing::instrument(name = "propagate_to_children", level = "debug", skip(conn, children_links), fields(parent_id = %parent_id, status = ?result_status))]
 pub(crate) async fn propagate_to_children<'a>(
     parent_id: &uuid::Uuid,
     result_status: &StatusKind,
+    children_links: Vec<(uuid::Uuid, bool)>,
     conn: &mut Conn<'a>,
 ) -> Result<Vec<uuid::Uuid>, DbError> {
-    use crate::schema::link::dsl as link_dsl;
     use crate::schema::task::dsl as task_dsl;
 
     let parent_succeeded = result_status == &StatusKind::Success;
@@ -83,35 +65,9 @@ pub(crate) async fn propagate_to_children<'a>(
     };
     metrics::record_dependency_propagation(outcome);
 
-    // Get all children of this parent task
-    let children_links: Vec<(uuid::Uuid, bool)> = link_dsl::link
-        .filter(link_dsl::parent_id.eq(parent_id))
-        .select((link_dsl::child_id, link_dsl::requires_success))
-        .load::<(uuid::Uuid, bool)>(conn)
-        .await?;
-
     if children_links.is_empty() {
         return Ok(vec![]);
     }
-
-    // A9: pre-lock the entire level's child set in one globally-ordered statement,
-    // BEFORE any batched UPDATE below. `SELECT … ORDER BY id FOR UPDATE` forces a
-    // canonical lock-acquisition order, so two concurrent propagations that share
-    // children (diamond DAG) can no longer acquire those locks in opposite orders
-    // and deadlock. No status filter here on purpose: locking a terminal child row
-    // is harmless (the guarded UPDATEs won't match it), and skipping the filter
-    // keeps the order stable no matter each child's progress. Held until COMMIT
-    // because this always runs inside a transaction (caller invariant).
-    let mut lock_ids: Vec<uuid::Uuid> = children_links.iter().map(|(cid, _)| *cid).collect();
-    lock_ids.sort();
-    lock_ids.dedup();
-    let _locked: Vec<uuid::Uuid> = task_dsl::task
-        .filter(task_dsl::id.eq_any(&lock_ids))
-        .select(task_dsl::id)
-        .order(task_dsl::id.asc())
-        .for_update()
-        .load::<uuid::Uuid>(conn)
-        .await?;
 
     // Split children into groups for batched operations
     let mut fail_child_ids: Vec<uuid::Uuid> = Vec::new();
@@ -246,10 +202,9 @@ pub(crate) async fn propagate_to_children<'a>(
 /// `parent_succeeded = false`. Per level the children split into a fail set
 /// (`requires_success = true`) and a plain `wait_finished` decrement set
 /// (`requires_success = false`); `wait_success` is **never** touched (no parent
-/// in the cascade succeeded). The A9 pre-lock and the A3 status filters
-/// (cascade-fail/decrement reach `Paused`; the Pending unblock stays
-/// `Waiting`-only) are preserved on every level exactly as in
-/// `propagate_to_children`.
+/// in the cascade succeeded). All downward task locks have already been taken
+/// by the caller. The A3 status filters (cascade-fail/decrement reach `Paused`;
+/// the Pending unblock stays `Waiting`-only) are preserved on every level.
 ///
 /// Returns the ids failed at levels **below** the input frontier (the input
 /// frontier is already tracked by the caller).
@@ -285,22 +240,6 @@ async fn cascade_failure_frontier<'a>(
         if children_links.is_empty() {
             break;
         }
-
-        // A9: pre-lock the level's whole child set in one globally-ordered
-        // statement BEFORE any UPDATE (identical rationale to
-        // `propagate_to_children`). A diamond inside the cascade means a child
-        // appears once per parent in the frontier — dedup the union for the lock
-        // set. No status filter (locking a terminal row is harmless).
-        let mut lock_ids: Vec<uuid::Uuid> = children_links.iter().map(|(cid, _)| *cid).collect();
-        lock_ids.sort();
-        lock_ids.dedup();
-        let _locked: Vec<uuid::Uuid> = task_dsl::task
-            .filter(task_dsl::id.eq_any(&lock_ids))
-            .select(task_dsl::id)
-            .order(task_dsl::id.asc())
-            .for_update()
-            .load::<uuid::Uuid>(conn)
-            .await?;
 
         // Split (all frontier parents failed): requires_success -> fail set,
         // otherwise -> wait_finished decrement MULTIPLICITY map. The fail set is
@@ -539,45 +478,23 @@ pub async fn cancel_task<'a>(
     // here (no reqwest in the call path); the delivery loop sends them async.
     db_operation::run_in_transaction(conn, |conn| {
         Box::pin(async move {
-            // A10: distinguish "task absent" (→ 404) from "wrong state" (→ 400).
-            // A bare `.first()?` would surface a missing task as a diesel NotFound
-            // that maps to a 500 Database error, so use `.optional()` and raise a
-            // typed `NotFound` instead.
-            let t = match task
-                .filter(id.eq(task_id))
-                .for_update()
-                .first::<Task>(conn)
-                .await
-                .optional()?
-            {
-                Some(t) => t,
+            let prepared = match db_operation::prepare_transition(
+                conn, task_id, db_operation::Transition::Cancel,
+            ).await? {
+                Some(s) => s,
                 None => {
-                    return Err(crate::error::ArcRunError::NotFound {
-                        message: format!("Task {} not found", task_id),
+                    let current = task.filter(id.eq(task_id)).select(status)
+                        .first::<StatusKind>(conn).await.optional()?;
+                    return Err(match current {
+                        None => crate::error::ArcRunError::NotFound {
+                            message: format!("Task {} not found", task_id),
+                        },
+                        Some(s) => crate::error::ArcRunError::InvalidState {
+                            message: format!("Cannot cancel task in {:?} state (only Pending, Waiting, Paused, Claimed, or Running tasks can be canceled)", s),
+                        },
                     });
                 }
             };
-
-            match t.status {
-                // A10: `Waiting` is now cancelable too — it lets an operator prune a
-                // not-yet-eligible DAG branch. A Waiting task never received on_start,
-                // so (like Pending) no cancel webhook is enqueued below; its children
-                // still cascade via `propagate_to_children` (Canceled == Failed).
-                StatusKind::Pending
-                | StatusKind::Waiting
-                | StatusKind::Paused
-                | StatusKind::Claimed
-                | StatusKind::Running => {}
-                other => {
-                    return Err(crate::error::ArcRunError::InvalidState {
-                        message: format!(
-                            "Cannot cancel task in {:?} state (only Pending, Waiting, Paused, \
-                             Claimed, or Running tasks can be canceled)",
-                            other
-                        ),
-                    });
-                }
-            }
 
             diesel::update(task.filter(id.eq(task_id)))
                 .set((
@@ -590,7 +507,7 @@ pub async fn cancel_task<'a>(
 
             // Propagate cancellation to dependent children (inside tx)
             let cascade_failed =
-                propagate_to_children(&task_id, &StatusKind::Canceled, conn).await?;
+                propagate_to_children(&task_id, &StatusKind::Canceled, prepared.children, conn).await?;
 
             // Dead-end ancestor cancellation (inside tx)
             let canceled_ancestors = if dead_end_enabled {
@@ -616,7 +533,7 @@ pub async fn cancel_task<'a>(
             // start_loop A4), so the cancel is delivered only after the actions exist; a
             // Claimed task that never returned a cancel action prefetches zero actions ⇒
             // fast-path success (no HTTP).
-            if matches!(t.status, StatusKind::Running | StatusKind::Claimed) {
+            if matches!(prepared.previous_status, StatusKind::Running | StatusKind::Claimed) {
                 enqueue_cancel_outbox(&task_id, conn).await?;
             }
             for child_id in &cascade_failed {

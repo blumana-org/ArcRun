@@ -11,7 +11,9 @@ use super::task_crud::release_slots_for_tasks;
 use super::webhook_execution::{
     decrement_batch_remaining_for_tasks, zero_batch_remaining_and_complete,
 };
-use super::{DbError, run_in_transaction, task_crud::insert_actions};
+use super::{
+    DbError, Transition, prepare_transition, run_in_transaction, task_crud::insert_actions,
+};
 
 /// Result of attempting to update a running task.
 ///
@@ -57,6 +59,17 @@ pub async fn update_running_task<'a>(
         // the delivery loop.
         let (rows, _cascade_failed, _ancestors) = run_in_transaction(conn, |conn| {
             Box::pin(async move {
+                let Some(prepared) = prepare_transition(
+                    conn,
+                    task_id,
+                    Transition::Complete {
+                        failure: matches!(s, Some(StatusKind::Failure | StatusKind::Canceled)),
+                    },
+                )
+                .await?
+                else {
+                    return Ok((0, Vec::new(), Vec::new()));
+                };
                 // Accept both Running and Claimed states to avoid a race condition
                 // where the on_start webhook target PATCHes the task before the
                 // worker loop transitions it from Claimed to Running.
@@ -91,7 +104,13 @@ pub async fn update_running_task<'a>(
                 if res == 1
                     && let Some(ref final_status) = dto.status
                 {
-                    cascade = workers::propagate_to_children(&task_id, final_status, conn).await?;
+                    cascade = workers::propagate_to_children(
+                        &task_id,
+                        final_status,
+                        prepared.children,
+                        conn,
+                    )
+                    .await?;
 
                     // Dead-end ancestor cancellation
                     if dead_end_enabled {
@@ -301,10 +320,20 @@ pub(crate) async fn fail_task_and_propagate<'a>(
     let reason_owned = reason.to_string();
     let updated = run_in_transaction(conn, |conn| {
         Box::pin(async move {
+            let Some(prepared) =
+                prepare_transition(conn, tid, Transition::Complete { failure: true }).await?
+            else {
+                return Ok(false);
+            };
             let updated = mark_task_failed(conn, &tid, &reason_owned).await?;
             if updated {
-                let cascade =
-                    workers::propagate_to_children(&tid, &StatusKind::Failure, conn).await?;
+                let cascade = workers::propagate_to_children(
+                    &tid,
+                    &StatusKind::Failure,
+                    prepared.children,
+                    conn,
+                )
+                .await?;
 
                 let ancestors = if dead_end_enabled {
                     let mut terminal_ids = vec![tid];

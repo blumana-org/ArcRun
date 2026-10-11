@@ -77,8 +77,6 @@ pub async fn cleanup_old_terminal_tasks<'a>(
         return Ok(0);
     }
 
-    let count = task_ids.len();
-
     run_in_transaction(conn, |conn| {
         Box::pin(async move {
             use crate::schema::action::dsl as action_dsl;
@@ -86,6 +84,21 @@ pub async fn cleanup_old_terminal_tasks<'a>(
             use crate::schema::task::dsl as task_dsl;
             use crate::schema::webhook_execution::dsl as we_dsl;
             use crate::schema::webhook_outbox::dsl as wo_dsl;
+
+            // Lock before deleting dependent records: a propagation can already
+            // own terminal children. Skip busy/missing rows and only clean the
+            // acquired set, leaving the rest for a later retention pass.
+            let task_ids: Vec<uuid::Uuid> = task_dsl::task
+                .filter(task_dsl::id.eq_any(&task_ids))
+                .select(task_dsl::id)
+                .order(task_dsl::id.asc())
+                .for_update()
+                .skip_locked()
+                .load(&mut *conn)
+                .await?;
+            if task_ids.is_empty() {
+                return Ok(0);
+            }
 
             // 1. Delete actions belonging to these tasks
             diesel::delete(action_dsl::action.filter(action_dsl::task_id.eq_any(&task_ids)))
@@ -127,7 +140,7 @@ pub async fn cleanup_old_terminal_tasks<'a>(
                  SELECT {cols}, now() FROM moved",
                 cols = ARCHIVE_COLUMNS
             );
-            diesel::sql_query(move_sql)
+            let count = diesel::sql_query(move_sql)
                 .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&task_ids)
                 .execute(&mut *conn)
                 .await?;

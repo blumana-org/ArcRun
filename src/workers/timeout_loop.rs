@@ -87,6 +87,7 @@ pub async fn timeout_loop(
                     timed_out_ids
                 );
 
+                let mut progressed = false;
                 // Step 2: for each, atomically mark failed + propagate (in tx).
                 for task_id in timed_out_ids {
                     let result = db_operation::timeout_task_and_propagate(
@@ -97,7 +98,8 @@ pub async fn timeout_loop(
                     .await;
 
                     match result {
-                        Ok(Some((_failed_task, _cascade_failed, _canceled_ancestors))) => {
+                        Ok(true) => {
+                            progressed = true;
                             metrics::record_task_timeout();
                             metrics::record_status_transition("Running", "Failure");
                             // on_failure notifications (task + cascade + dead-end
@@ -105,10 +107,10 @@ pub async fn timeout_loop(
                             // transaction; the delivery loop sends them async.
                             enqueued_outbox = true;
                         }
-                        Ok(None) => {
-                            // Task already transitioned concurrently, nothing to do
+                        Ok(false) => {
+                            // Candidate progressed, transitioned, or a cascade row is busy
                             log::debug!(
-                                "Timeout worker: task {} already transitioned, skipping",
+                                "Timeout worker: task {} not eligible or cascade busy, skipping",
                                 task_id
                             );
                         }
@@ -122,8 +124,9 @@ pub async fn timeout_loop(
                     }
                 }
 
-                // Fewer than a full batch => backlog drained, stop early.
-                if batch_len < timeout_batch_size {
+                // Stop on a short batch or a wholly busy/ineligible prefix; do not
+                // repeatedly compute the same closures until the next iteration.
+                if !progressed || batch_len < timeout_batch_size {
                     break;
                 }
                 if pass + 1 == MAX_TIMEOUT_DRAIN_PASSES {

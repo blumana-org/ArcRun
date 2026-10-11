@@ -75,9 +75,9 @@ candidate rows read. Cache hits have separate Concurrency and Capacity counters.
 
 Each iteration first requeues stale Claimed tasks whose activity timestamp is older than `WORKER_CLAIM_TIMEOUT_SECS`. Requeue releases their reservations and makes them Pending again.
 
-The worker then finds Running tasks whose `last_updated` exceeds their task-specific timeout. It rechecks inactivity when locking each candidate, so progress persisted after the scan prevents a stale timeout. Each timeout commits Failure with reason `Timeout`, dependency propagation, reservation release, and failure-notification enqueue.
+The worker then finds Running tasks whose `last_updated` exceeds their task-specific timeout. It locks each candidate's complete possible downward write set in UUID order with `SKIP LOCKED`, and verifies both that every required row was acquired and that the locked root is still inactive. A busy descendant defers the entire timeout without state changes; a later pass recomputes the set and rechecks inactivity. A committed timeout includes Failure with reason `Timeout`, dependency propagation, reservation release, and failure-notification enqueue. Batch/slot writes can still wait after task acquisition.
 
-Timed-out tasks are processed oldest first, in passes of at most `WORKER_TIMEOUT_BATCH_SIZE`. An iteration drains at most 50 full passes before yielding. This bounds the work between stale-claim checks.
+Timed-out tasks are processed oldest first, in passes of at most `WORKER_TIMEOUT_BATCH_SIZE`. An iteration drains at most 50 full passes before yielding, and stops early when a pass commits no timeout. This avoids repeatedly traversing the same busy closures within one iteration. A busy oldest prefix can defer later candidates; there is no fixed timeout-processing deadline under contention.
 
 Timeout measures inactivity. Persisted counter updates and PATCH updates refresh `last_updated`; an update merely accepted into the in-memory PUT queue has not yet refreshed it.
 
@@ -87,7 +87,7 @@ Timeout measures inactivity. Persisted counter updates and PATCH updates refresh
 
 A flush updates counters and `last_updated`, and reduces any capacity reservations in the same transaction. Persisted counter sums are computed with wider arithmetic and clamped to `i32::MAX`.
 
-The flush locks its task rows in UUID order before reading and locking their stored capacity keys. A terminal transition therefore cannot hold a task while waiting on a slot held by that same task's flush. Batch stop and batch-rules edits also pre-lock their eligible task sets in UUID order. These rules eliminate the task/slot inversion; propagation across multiple dependency frontiers still has no single global task order.
+The flush locks its task rows in UUID order before reading and locking their stored capacity keys. Terminal transitions lock their complete possible downward write set in that same order before changing the root. Batch stop, batch-rules edits and rule-free batch claims also lock their eligible task sets in UUID order. Propagation no longer acquires blocking locks one frontier at a time; this closes the cross-frontier and parent/child cycles as well as the task/slot inversion.
 
 Failure handling distinguishes several cases:
 
@@ -107,6 +107,8 @@ The lease, retries, ordering, and receiver contract are documented in [Webhooks]
 The retention worker always attempts to remove unused rule-slot rows. It locks empty slots in key order with `SKIP LOCKED`; busy rows are reconsidered on a later pass, so cleanup does not wait on admission or release. Task archiving and archive purging run only when `RETENTION_ENABLED=1`.
 
 A task is eligible for archiving when it is terminal and its `ended_at` is older than `RETENTION_DAYS`. It is retained while its own notification is queued, its batch-complete notification is queued, or its batch has completion actions and is still incomplete.
+
+Before removing actions, webhook records or links, retention locks the selected tasks in UUID order with `SKIP LOCKED`. Only the acquired subset is archived and counted. Busy tasks and their associated records remain for a later pass.
 
 Eligible tasks move to `task_archive` in a transaction that also removes their actions, dependency links, and webhook records. Empty batch records are cleaned up once no pending batch notification requires them.
 

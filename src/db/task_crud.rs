@@ -496,9 +496,8 @@ pub async fn claim_task<'a>(conn: &mut Conn<'a>, task_id: &uuid::Uuid) -> Result
     Ok(updated_count == 1)
 }
 
-/// Atomically claim a contiguous run of rule-free Pending tasks in a single
-/// `UPDATE ... WHERE id = ANY($ids) AND status='pending'
-/// AND start_condition='[]'::jsonb RETURNING id`.
+/// Atomically claim a contiguous run of rule-free Pending tasks in one statement:
+/// an ordered locking CTE followed by a guarded UPDATE ... RETURNING id.
 ///
 /// Only valid for tasks with an empty `start_condition` (no concurrency/capacity
 /// rules), because a single UPDATE cannot evaluate per-task rules. Returns the set
@@ -509,26 +508,29 @@ pub async fn batch_claim_tasks<'a>(
     conn: &mut Conn<'a>,
     ids: &[uuid::Uuid],
 ) -> Result<Vec<uuid::Uuid>, DbError> {
-    use crate::schema::task::dsl::*;
-    use diesel::dsl::now;
-
     if ids.is_empty() {
         return Ok(vec![]);
     }
-
-    let claimed_ids = diesel::update(
-        task.filter(
-            id.eq_any(ids)
-                .and(status.eq(StatusKind::Pending))
-                .and(start_condition.eq(rule::Rules::default())),
-        ),
+    #[derive(diesel::QueryableByName)]
+    struct Claimed {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: uuid::Uuid,
+    }
+    // ANY(array) does not impose an acquisition order on UPDATE. Fold the
+    // ordered pre-lock into the same statement, preserving the rule-free guards.
+    let claimed = diesel::sql_query(
+        "WITH candidates AS MATERIALIZED (
+            SELECT id FROM task WHERE id=ANY($1) AND status='pending'
+              AND start_condition='[]'::jsonb ORDER BY id FOR UPDATE
+         )
+         UPDATE task SET status='claimed', last_updated=now()
+         FROM candidates c WHERE task.id=c.id AND task.status='pending'
+           AND task.start_condition='[]'::jsonb RETURNING task.id",
     )
-    .set((status.eq(StatusKind::Claimed), last_updated.eq(now)))
-    .returning(id)
-    .get_results::<uuid::Uuid>(conn)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
+    .get_results::<Claimed>(conn)
     .await?;
-
-    Ok(claimed_ids)
+    Ok(claimed.into_iter().map(|t| t.id).collect())
 }
 
 /// Transition a Claimed task to Running and set started_at.

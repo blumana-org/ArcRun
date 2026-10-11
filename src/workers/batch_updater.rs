@@ -234,12 +234,13 @@ async fn final_flush_batch_data(data: &CountMap, pool: &DbPool) {
 /// (`40P01`). To give this flush a canonical acquisition order, the ids are **sorted**
 /// and the whole flush runs in ONE transaction that first pre-locks the target rows
 /// with `SELECT id … WHERE id = ANY(...) ORDER BY id FOR UPDATE` (matching the order
-/// `propagate_to_children` uses), then runs the guarded UPDATE. The pre-lock does NOT
-/// filter on status — locking a terminal row is harmless and keeps the order stable;
-/// the A7 terminal guard still lives in the UPDATE itself. Should a `40P01` still slip
-/// through (e.g. crossing via a parent row not in this array), it surfaces as an `Err`
-/// here and the caller (`flush_updates`) falls back to the per-row path. That path
-/// still acquires capacity slots, but always AFTER its task row, matching release.
+/// terminal transitions use for their complete downward set), then runs the guarded
+/// UPDATE. The pre-lock does NOT filter on status — locking a terminal row is
+/// harmless and keeps the order stable; the A7 terminal guard stays in the UPDATE.
+/// A database error surfaces
+/// as an `Err` here and the caller (`flush_updates`) falls back to the per-row path.
+/// That path still acquires capacity slots, but always AFTER its task row,
+/// matching release.
 ///
 /// Two audit-A7 guards live in the SQL:
 /// * `AND task.status NOT IN ('success','failure','canceled')` — never mutate a
@@ -259,7 +260,7 @@ async fn handle_batch_with_counts(
     conn: &mut Conn<'_>,
 ) -> Result<usize, DbError> {
     // A9: sort by task_id so the pre-lock (and the UPDATE it guards) acquire row
-    // locks in the same canonical order `propagate_to_children` uses.
+    // locks in the same canonical order terminal transitions use.
     let mut ordered: Vec<Update> = updates.to_vec();
     ordered.sort_by_key(|(id, _, _)| *id);
 

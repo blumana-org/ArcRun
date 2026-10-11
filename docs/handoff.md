@@ -2,6 +2,18 @@
 
 Contexte de reprise pour la prochaine session.
 
+**Correctif du 2026-10-11, audit point 3 (suite)** : les transitions terminales
+préverrouillent leur ensemble descendant complet en ordre UUID avant l'écriture
+racine. Le parcours de propagation par frontière demeure ; ses prélocks locaux
+disparaissent. Une terminaison sans enfant réutilise la lecture initiale des liens
+et ne rajoute aucune requête. Claim groupé sans règles trié dans sa CTE ; rétention
+limitée aux lignes obtenues par `SKIP LOCKED`. Timeout : ensemble descendant
+entièrement acquis sans attente ou tentative différée sans écriture, puis recheck
+d'inactivité. Aucun mutex de batch, Redis ou retry générique. Huit régressions
+dans `test_bug_audit8`, dont deux qui reproduisent le deadlock avant correctif.
+Mesures CPU Rust/PostgreSQL et limites mémoire : fin de `docs/perf-correctness-plan.md`.
+Le cas dedupe multi-clés de l'insertion reste distinct et hors périmètre.
+
 **Correctif du 2026-10-10, saturation Capacity** : cache de refus SQL limité au
 scan courant, commun à Concurrency et Capacity. Clé canonique exacte + seuil,
 4 096 entrées et 1 Mio de texte de clés maximum (table de hachage en plus).
@@ -16,8 +28,8 @@ et le premier upsert dans une CTE ; pas d'aller-retour supplémentaire ni d'UPDA
 spéculatif de tâche en cas de règle bloquante. Arrêt de batch et édition de règles
 préverrouillent leurs ensembles ; GC des slots trié et `SKIP LOCKED`.
 Régressions déterministes : `test_bug_audit6`. Mesures et limites : fin de
-`docs/perf-correctness-plan.md`. Les cascades gardent leur parcours par frontière ;
-aucune garantie générale d'absence de deadlock ni retry générique ajouté.
+`docs/perf-correctness-plan.md`. Les cycles entre frontières encore possibles à
+cette date sont traités par le correctif du 2026-10-11 ci-dessus.
 
 ## Campagne en cours : fixes Audit 2 (depuis 2026-07-08)
 
@@ -89,7 +101,7 @@ limites 5.3 = 1000 tâches/batch, 100 deps/tâche, 20 actions/tâche, payload 2 
   design et décisions actées : `docs/perf-correctness-plan.md` — à lire avant de toucher
   claim loop / outbox / insertion groupée / batch-complete, pour ne pas régresser une
   décision déjà tranchée (LIMIT-less visibility, on_start synchrone = control-flow,
-  pas de CTE récursive, enqueue outbox inconditionnel…).
+  pas de réécriture SQL de la propagation, enqueue outbox inconditionnel…).
 - Audit 1 (2026-02-14) : `docs/audits/AUDIT_1_*.md`, régressions dans
   `tests/integration/test_bug_audit{1,2}.rs`.
 

@@ -304,6 +304,8 @@ Décisions actées :
 - ~~CTE récursive pour `propagate_to_children`~~ — écarté : la logique par niveau
   (échecs `requires_success` + décréments + transition Pending) est délicate en SQL pur et
   la version actuelle est déjà batchée par niveau. Rapport risque/gain défavorable.
+  Le correctif du 2026-10-11 utilise une CTE uniquement pour calculer/verrouiller
+  l'ensemble touché ; les écritures de propagation restent dans le parcours existant.
 
 ## Améliorations notées, non planifiées
 
@@ -390,7 +392,8 @@ Statuts, propagation, capacité, compteurs de batch et outbox restent dans leurs
 transactions actuelles. Aucun verrou externe, aucun changement de schéma, aucun
 verrou global de batch n'est ajouté au chemin nominal.
 
-Le parcours de propagation reste ordonné par frontière, pas par transaction
+À cette date (limite traitée par le correctif du 2026-10-11 ci-dessous), le parcours
+de propagation reste ordonné par frontière, pas par transaction
 entière : les cycles entre tâches de plusieurs niveaux ne sont pas éliminés par
 ce correctif. Le fallback du flush par tâche est conservé. Aucun retry générique
 n'est ajouté : diesel-async 0.9.0 classe le SQLSTATE 40P01 en `Unknown` et son
@@ -483,3 +486,123 @@ Docker étant indisponible, les intégrations de cette session utilisent Postgre
 17.11 avec ICU ; le backend de test Docker reste PostgreSQL 18 par défaut. Après
 une interruption par manque d'espace disque, les 310 intégrations ont été rejouées
 avec succès par groupes, en nettoyant leurs bases temporaires entre groupes.
+
+## Ordre global des tâches sur une transition — 2026-10-11 (audit point 3)
+
+La proposition retenue acquiert tout l'ensemble descendant susceptible d'être
+écrit avant la première écriture, en ordre UUID. Trier chaque frontière ne suffisait
+pas : deux transactions pouvaient acquérir X puis Y et Y puis X à des niveaux
+différents. Les transitions terminales passent maintenant par `prepare_transition`.
+Le succès verrouille racine + enfants directs ; l'échec, le cancel et le timeout
+verrouillent la fermeture non terminale via `requires_success`, plus un saut de
+toutes les arêtes depuis cette fermeture. Les gardes des UPDATE de propagation
+restent inchangées. Une terminaison sans enfant conserve seulement son UPDATE
+gardé comme verrou bloquant ; la lecture initiale des liens est réutilisée.
+
+Le calcul suppose les liens figés après insertion et les états terminaux
+irréversibles. Une branche déjà terminale n'a pas à être parcourue ; une branche
+devenue terminale pendant l'attente peut être surverrouillée. La rétention peut
+retirer des lignes/liens, mais ne peut agrandir cet ensemble. L'éligibilité racine
+est revérifiée après le verrou, ou par l'UPDATE gardé du chemin sans enfant.
+Un agrégat force la consommation complète de la CTE verrouillante et ne renvoie
+que le statut racine. `EXISTS`/`LIMIT 1` ne conviendraient pas : PostgreSQL peut
+n'évaluer que la partie demandée d'une CTE SELECT. Voir les documentations
+[WITH](https://www.postgresql.org/docs/17/queries-with.html#QUERIES-WITH-SELECT)
+et [ordre/verrouillage](https://www.postgresql.org/docs/17/sql-select.html#SQL-FOR-UPDATE-SHARE)
+(les UUID servant au tri sont immuables).
+
+Le claim groupé sans règles était un autre accès multi-tâches en ordre de
+planificateur : une CTE triée précède désormais son UPDATE dans la même instruction,
+avec les mêmes gardes de statut/règles. La rétention verrouille sa sélection avec
+`SKIP LOCKED` avant les suppressions associées, ne traite que les IDs obtenus et
+renvoie le nombre réellement archivé. Flush, arrêt de batch et édition des règles
+conservent leurs prélocks globaux existants.
+
+### Compromis du timeout et garanties
+
+Le timeout essaie **tout** l'ensemble descendant avec `SKIP LOCKED`, puis vérifie
+que le nombre de lignes acquises correspond à l'ensemble requis. Une seule ligne
+occupée ou disparue diffère l'opération entière, sans statut, compteur ou outbox
+partiellement modifiés. Le prochain passage recalcule l'ensemble et revérifie
+l'inactivité. Une passe sans progrès arrête le drain courant pour éviter de
+recalculer les mêmes fermetures 50 fois. Un préfixe de candidats occupés peut
+différer les candidats suivants ; aucune échéance murale n'est garantie sous
+contention. Les verrous de batch/slots peuvent encore attendre après ceux des tâches.
+
+Les ancêtres dead-end restent acquis sans attente après les verrous descendants,
+avant batch puis slots. Le périmètre atomique statut/compteurs/réservations/outbox
+ne change pas. Aucun verrou global de batch ni retry serveur générique n'est
+ajouté. Les ensembles disjoints restent concurrents ; les ensembles qui se
+recouvrent peuvent attendre plus tôt et garder certaines lignes plus longtemps.
+Le pré-calcul d'une fermeture devenue obsolète pendant l'attente est du travail
+supplémentaire possible. Ce changement supprime les cycles task/task des chemins
+couverts, sans prétendre prouver toute l'application exempte de deadlocks : les
+advisory locks dedupe de plusieurs tâches à l'insertion restent un sujet distinct.
+
+### Mesures des transitions
+
+Comparaison de `7092f5b` et du correctif sur PostgreSQL 17.11 local, macOS ARM64,
+profil test Rust `opt-level=1`. Le benchmark ignoré par défaut
+`test_bug_audit8::benchmark_task_transition_locks` appelle le vrai
+`update_running_task` via Diesel : aucune latence HTTP, aucun worker concurrent,
+aucune action webhook ni ligne batch enregistrée. Les données et ANALYZE sont
+hors mesure. Chaque cas utilise une base neuve, trois répétitions. La dernière
+paire exécute après puis avant, sans compilation parallèle.
+
+| Cas | Requêtes avant → après | Temps total avant → après | CPU Rust avant → après | CPU backend PG avant → après |
+|---|---:|---:|---:|---:|
+| 500 succès sans enfant | 4 000 → 4 000 | 347,91 → 358,08 ms | 85,74 → 89,13 ms | 153,20 → 152,53 ms |
+| 500 échecs sans enfant | 4 000 → 4 000 | 358,45 → 353,58 ms | 86,33 → 88,26 ms | 149,58 → 153,45 ms |
+| Chaîne de 500 tâches, 1 échec racine | 2 004 → 1 506 | 149,67 → 136,85 ms | 47,24 → 41,19 ms | 51,55 → 54,17 ms |
+| Éventail de 10 000 tâches, 1 échec racine | 10 010 → 10 010 | 1 190,31 → 1 158,23 ms | 316,67 → 316,59 ms | 465,17 → 485,91 ms |
+| Losanges, 2 001 tâches, 1 échec racine | 2 038 → 2 029 | 235,41 → 236,44 ms | 66,27 → 64,95 ms | 95,95 → 102,64 ms |
+
+Médianes ; les requêtes incluent BEGIN/COMMIT. Le CPU Rust vient de `getrusage`.
+Le CPU PostgreSQL est mesuré dans une paire **séparée** avec
+`log_statement_stats=on`, en additionnant les phases parse/bind/execute après
+ANALYZE : il inclut l'instrumentation et exclut les processus PostgreSQL annexes.
+Ce ne sont pas des mesures du CPU global de production. Les temps absolus restent
+sensibles à la machine. Aucune perte significative de débit nominal n'est établie
+par ces quelques essais ; ils n'établissent pas non plus un gain sous charge réelle.
+
+Le gain SQL se concentre sur les cascades profondes (−498 requêtes, −13 % CPU Rust
+sur la chaîne). Les petites transitions restent proches du nominal, sans requête
+supplémentaire. Sur les graphes larges/losanges, le CPU PG augmente ici de 4,5 % à
+7 % pour découvrir et matérialiser la fermeture ; le parcours métier et ses
+lectures de notifications par tâche demeurent.
+
+La mémoire n'est pas gratuite : sur l'éventail de 10 000 tâches, le maximum RSS
+observé du backend PG passe d'une médiane de 54 192 à 61 216 Kio (environ +6,9 Mio).
+Cet indicateur est cumulatif depuis le démarrage du backend, inclut la préparation
+des données et les pages partagées mappées ; il n'isole pas la mémoire de la CTE
+et ne mesure pas la RAM totale du serveur. Le Rust ne reçoit pas la fermeture
+entière, mais accumule déjà les IDs des tâches échouées : pas de promesse O(largeur)
+sur toute sa mémoire, ni de baisse de RSS démontrée. Les très grands DAG et le
+nombre de transitions concurrentes restent à dimensionner en charge représentative.
+Le surcoût du claim groupé et de la rétention n'est pas chiffré par ce benchmark :
+le premier conserve une instruction avec tri/verrous supplémentaires ; la seconde
+ajoute une sélection verrouillante par lot non vide.
+
+Artefacts bruts : `/private/tmp/arcrun-audit8-em71nhw1/{before,after}-final-bench.log`,
+`pg-profile.json`, `profile_db.py`. Reproduction de la version courante :
+`cargo test --test integration test_bug_audit8::benchmark_task_transition_locks -- --ignored --exact --nocapture`.
+
+### Validation
+
+Les huit régressions ajoutées couvrent échec/échec, échec/succès, flush/cascade,
+claim sans règles/flush, timeout complet et activité fraîche, PATCH idempotent,
+rétention face à une tâche occupée et trois séries de 50 transitions concurrentes
+sur 2 050 tâches. Le DAG déterministe est valide dans l'API : création A,B,P,X,Y,Z,
+arêtes A→P→X, A→Y,Z, B→X,Y ; Z sert de barrière SQL. Les arêtes d'attente sont
+observées via `pg_blocking_pids`, sans hypothèse FIFO ni hook de production.
+Les deux variantes échec/échec et échec/succès échouent effectivement avec
+`deadlock detected` sur l'ancien code, puis passent après le correctif. Elles
+vérifient aussi les événements terminaux uniques et `batch.remaining`.
+
+Le test antérieur d'inactivité périmée du timeout conserve son objectif en
+bloquant l'écriture du compteur batch, puisque le nouveau timeout n'attend plus
+un enfant occupé. Validation finale : **61 unitaires + 318 intégrations + 5 doctests
+= 384 tests passés**, Clippy workspace strict et formatage propres. Les 318 bases
+de cette dernière suite totalisent **0 deadlock** dans `pg_stat_database`.
+Les deux benchmarks manuels restent ignorés dans la suite par défaut. Ces tests
+ne mesurent ni la fréquence des anciens deadlocks en production ni les p99 HTTP.

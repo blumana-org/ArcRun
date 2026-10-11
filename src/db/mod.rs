@@ -2,6 +2,7 @@ mod batch_listing;
 mod cleanup;
 mod task_crud;
 mod task_lifecycle;
+mod task_locking;
 mod task_query;
 mod webhook_execution;
 mod webhook_outbox;
@@ -12,6 +13,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub(crate) type DbError = crate::error::ArcRunError;
+pub(crate) use task_locking::{Transition, prepare_transition};
 
 // Re-exports from task_crud
 pub use crate::rule::concurrency_lock_key;
@@ -34,8 +36,9 @@ pub(crate) use task_lifecycle::{
 pub(crate) use task_query::{
     PendingCursor, count_running_tasks_by_kind, count_tasks_by_status, find_timed_out_tasks,
     get_dag_for_batch, list_pending_page, list_task_filtered_paged, requeue_stale_claimed_tasks,
-    timeout_task_and_propagate,
 };
+// Exposed so integration tests can exercise one real timeout attempt.
+pub use task_query::timeout_task_and_propagate;
 
 // Re-exports from batch_listing
 pub(crate) use batch_listing::{get_batch_stats, list_batches, update_batch_rules};

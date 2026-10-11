@@ -55,7 +55,7 @@ tests/integration/     # Integration tests (testcontainers PostgreSQL)
 6. **PATCH `metadata` is a full replace, not a merge** — omitted keys are dropped (including keys used by dedupe/rule matchers).
 7. **Terminal counters are frozen**: a batch-updater flush landing on a terminal task is dropped, never re-queued (A7).
 8. **Slot release never recomputes**: `claimed_slot_keys`/`capacity_charge` are read back as stored (metadata/expected_count are mutable while Running); released in the same tx as EVERY exit from Claimed/Running.
-9. **A9 lock ordering**: task rows before batch/slot rows; blocking acquisitions of known task sets are sorted. Slot keys use Rust byte order and SQL `COLLATE "C"`. Claim folds its task lock into the first slot upsert. Propagation orders each frontier, not the entire DAG, so residual task-to-task deadlocks remain possible.
+9. **A9 lock ordering**: acquire the entire possible blocking task set in UUID order before any write, then batch, then slots. Terminal transitions use `prepare_transition`; leaf completions need only their guarded root UPDATE. Later dead-end ancestor locks are nonblocking. Timeout attempts use `SKIP LOCKED` for the complete downward set and defer without writes if any row is missing. Rule-free batch claims also lock in UUID order; retention only archives its locked subset. Slot keys use Rust byte order and SQL `COLLATE "C"`. Rule admission folds its task lock into the first slot upsert. This relies on immutable terminal states and no new edges into committed graphs.
 10. **Routes are centralized** in `handlers::configure_routes`, shared by main server and test server.
 11. **Actions are per-task** (own records, never shared).
 
