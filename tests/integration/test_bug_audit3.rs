@@ -1704,13 +1704,14 @@ async fn test_audit2_a3_batch_complete_after_cascade_fail_of_paused() {
 // and both inserted — producing duplicates despite `dedupe_strategy`.
 //
 // # Fix
-// Before running the counts, `handle_dedupe` now takes a `pg_advisory_xact_lock` on a
+// Before running the counts, `lock_batch_dedupe` takes a `pg_advisory_xact_lock` on a
 // stable hash of each applicable matcher (`rule::dedupe_lock_key` = kind + status +
 // the matcher's metadata field values). Because it runs inside the `insert_task_batch`
 // transaction, the lock is held until COMMIT/ROLLBACK, so a second concurrent request
 // with the same key parks on the lock until the first commits, then observes the
 // just-inserted row (`count > 0`) and correctly dedupes. Keys are acquired
-// sorted+deduped in one round-trip to keep a consistent global lock order.
+// sorted+deduped across the whole batch in one round-trip (audit9 follow-up),
+// keeping a consistent global lock order even across tasks.
 //
 // # What these tests assert
 // * `test_audit2_a8_concurrent_same_key_creates_exactly_one` — N concurrent identical

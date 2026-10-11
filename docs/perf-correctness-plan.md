@@ -536,8 +536,8 @@ ajouté. Les ensembles disjoints restent concurrents ; les ensembles qui se
 recouvrent peuvent attendre plus tôt et garder certaines lignes plus longtemps.
 Le pré-calcul d'une fermeture devenue obsolète pendant l'attente est du travail
 supplémentaire possible. Ce changement supprime les cycles task/task des chemins
-couverts, sans prétendre prouver toute l'application exempte de deadlocks : les
-advisory locks dedupe de plusieurs tâches à l'insertion restent un sujet distinct.
+couverts, sans prétendre prouver toute l'application exempte de deadlocks. Le cas
+distinct des advisory locks dedupe à l'insertion est traité dans la section suivante.
 
 ### Mesures des transitions
 
@@ -606,3 +606,60 @@ un enfant occupé. Validation finale : **61 unitaires + 318 intégrations + 5 do
 de cette dernière suite totalisent **0 deadlock** dans `pg_stat_database`.
 Les deux benchmarks manuels restent ignorés dans la suite par défaut. Ces tests
 ne mesurent ni la fréquence des anciens deadlocks en production ni les p99 HTTP.
+
+## Dedupe multi-clés : ordre global du batch — 2026-10-11
+
+Le dernier cas identifié sur l'insertion venait du tri limité à une tâche : un
+batch pouvait garder la clé H puis demander L, tandis qu'un autre gardait L puis
+demandait H. `lock_batch_dedupe` collecte maintenant les clés applicables de toute
+la requête, trie/déduplique les `i64`, puis exécute une seule acquisition ordonnée
+avant les premières insertions de tâches et les checks dedupe.
+
+La requête `SELECT pg_advisory_xact_lock(k) FROM unnest($1::bigint[]) AS keys(k)
+ORDER BY k` consomme tout le résultat, sans LIMIT. La fonction de verrouillage
+n'est pas une expression de tri : PostgreSQL l'évalue après le tri de `k`, comme
+décrit dans [SELECT List](https://www.postgresql.org/docs/17/sql-select.html#SQL-SELECT-LIST).
+Les verrous restent transactionnels jusqu'au commit/rollback. Tous les inserteurs
+doivent suivre cet ordre ; les anciennes instances peuvent encore introduire un
+cycle pendant un déploiement mixte.
+
+Les checks COUNT et les insertions continuent dans l'ordre d'entrée, dans la même
+transaction : une tâche peut toujours être dédupliquée contre une tâche insérée
+plus tôt dans ce batch. Les dépendances vers un parent skipped restent ignorées,
+les réponses conservent leur ordre et `batch.remaining` compte les insertions
+effectives. Le calcul des clés et les règles de matching ne changent pas. Un
+matcher dont un champ manque ne prend aucun verrou ; une liste de champs vide
+reste applicable même sans metadata. Aucune nouvelle lecture SQL ni dépendance.
+
+Coût : collecte en une passe, tri `O(K log K)`, mémoire `O(K)` pour les clés
+collectées (8 octets par élément, capacité du Vec et buffers SQL en plus), sans
+copier les metadata dans cette collecte. Le Vec est libéré après l'acquisition,
+avant les checks/insertions. Le nombre de requêtes de verrouillage passe de N
+(nombre de tâches avec matchers applicables) à 1 par batch non vide en clés, et
+reste 0 sans clé applicable. Les checks COUNT ne sont pas groupés ni mis en cache.
+Les clés sont détenues plus tôt, parfois plus longtemps : c'est le compromis de
+contention. Le nombre de clés distinctes acquises par un batch réussi est le même.
+
+Trois régressions dans `test_bug_audit9` :
+
+- Deux POST d'ordres opposés, synchronisés par une troisième clé G et
+  `pg_blocking_pids`, sans hypothèse FIFO. Avec L < H < G, le premier batch veut
+  H,G puis L et le second L puis H. Le verrou externe sur G permet d'observer
+  les deux attentes avant de libérer la barrière. L'ancien code produit un
+  `deadlock detected` et un HTTP 500 ; le correctif produit 201 puis 204,
+  exactement deux tâches/actions, deux batches et les compteurs remaining 2 et 0.
+- Un préfixe sans dedupe, des doublons internes et un enfant dépendant d'un parent
+  inséré et d'un parent skipped conservent leur résultat. L'instrumentation Diesel
+  mesure **3 → 1 requêtes de verrouillage** ; un batch suivant sans règles n'en
+  ajoute aucune.
+- Les matchers avec metadata absente ou champ manquant n'attendent pas une
+  connexion qui détient les clés qu'ils auraient calculées sans les gardes.
+
+Ces mesures vérifient les allers-retours, pas un pourcentage de gain CPU/RAM ou
+de débit HTTP. Serveur de validation jetable : PostgreSQL 17.11 local ; artefacts
+dans `/private/tmp/arcrun-dedupe-ug3vnb96/` (`before-tests.log`, `after-targeted.log`,
+`integration.log`). Le point 5 initial, coût du listing des batches, reste ouvert.
+
+Validation finale : **61 tests unitaires + 321 intégrations + 5 doctests = 387
+tests passés**, Clippy workspace strict (`--all-targets --all-features -- -D warnings`)
+et formatage propres. Les 321 bases de la dernière suite totalisent **0 deadlock**.

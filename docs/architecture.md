@@ -28,6 +28,8 @@ Task creation validates the complete request before inserting tasks, dependency 
 
 Tasks without deduplication checks are inserted in groups. Inserts are split to stay within PostgreSQL's bind-parameter limit while sharing the same transaction. Deduplication checks can see tasks inserted earlier in that transaction.
 
+Before inserting tasks, the transaction collects the applicable dedupe advisory keys for the entire request, sorts/deduplicates them and acquires them in one ordered statement. Missing-field matchers contribute no lock. Dedupe checks and task inserts retain input order; only lock acquisition moves earlier. Keys stay held until commit/rollback, so requests with overlapping keys wait consistently even when their task orders differ. A batch without applicable keys issues no advisory-lock query.
+
 ## Transaction boundaries
 
 | Operation | Committed together |
@@ -54,7 +56,7 @@ Before a terminal transition writes anything, `prepare_transition` reads the roo
 
 This set is conservative: terminal states cannot be reopened and edges cannot be added to a committed graph. Eligibility is checked again after locking. Already-terminal PATCH requests avoid traversing or locking descendants. An aggregate consumes the complete locking CTE and returns only the root status; the closure stays in PostgreSQL, where its traversal, materialization and sort still cost CPU and memory. The Rust frontier walk and its accumulated failed IDs remain unchanged.
 
-All blocking task locks precede batch and reservation locks. Dead-end ancestor acquisition remains nonblocking (`SKIP LOCKED`), before batch/slot writes. Flushes, batch stop, rule edits and rule-free batch claims follow the same global task order; retention only processes its nonblocking locked subset. No batch-wide mutex or generic transaction retry is added. Multi-key deduplication advisory locks during insertion remain a separate ordering limitation.
+All blocking task locks precede batch and reservation locks. Dead-end ancestor acquisition remains nonblocking (`SKIP LOCKED`), before batch/slot writes. Flushes, batch stop, rule edits and rule-free batch claims follow the same global task order; retention only processes its nonblocking locked subset. No batch-wide mutex or generic transaction retry is added. Insertion orders all dedupe advisory keys before its task writes, as described above.
 
 Paused tasks still receive dependency-counter updates and can fail because a required parent failed. A paused task whose dependencies are satisfied stays Paused until explicitly resumed.
 

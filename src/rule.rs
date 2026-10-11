@@ -203,7 +203,7 @@ pub fn capacity_slot_key(
 }
 
 /// Compute a deterministic i64 advisory lock key for a dedupe matcher and task
-/// metadata. Used by `handle_dedupe` to serialize the check-then-act dedupe window
+/// metadata. Used by batch dedupe locking to serialize the check-then-act window
 /// between concurrent `POST /task` requests (Audit 2 A8).
 ///
 /// Uses a distinct "dedupe" prefix so its keys don't collide with concurrency

@@ -2,6 +2,15 @@
 
 Contexte de reprise pour la prochaine session.
 
+**Correctif du 2026-10-11, dedupe multi-clés** : l'insertion collecte toutes les
+clés advisory applicables du batch, les trie/déduplique et les acquiert en une
+requête avant les premières écritures de tâches. Les checks et insertions gardent
+l'ordre d'entrée. Aucun verrou pour les matchers aux champs absents ; aucun SQL
+supplémentaire pour les batches sans dedupe. Régressions `test_bug_audit9` : cycle
+entre batches d'ordres opposés, ordre d'insertion/dépendances et nombre de requêtes,
+matchers inapplicables. Le scénario concurrent reproduit un deadlock sur l'ancien
+code. Le point 5 de l'audit initial (coût du listing des batches) reste ouvert.
+
 **Correctif du 2026-10-11, audit point 3 (suite)** : les transitions terminales
 préverrouillent leur ensemble descendant complet en ordre UUID avant l'écriture
 racine. Le parcours de propagation par frontière demeure ; ses prélocks locaux
@@ -12,7 +21,7 @@ entièrement acquis sans attente ou tentative différée sans écriture, puis re
 d'inactivité. Aucun mutex de batch, Redis ou retry générique. Huit régressions
 dans `test_bug_audit8`, dont deux qui reproduisent le deadlock avant correctif.
 Mesures CPU Rust/PostgreSQL et limites mémoire : fin de `docs/perf-correctness-plan.md`.
-Le cas dedupe multi-clés de l'insertion reste distinct et hors périmètre.
+Le cas dedupe multi-clés de l'insertion est traité par le correctif ci-dessus.
 
 **Correctif du 2026-10-10, saturation Capacity** : cache de refus SQL limité au
 scan courant, commun à Concurrency et Capacity. Clé canonique exacte + seuil,

@@ -58,6 +58,7 @@ tests/integration/     # Integration tests (testcontainers PostgreSQL)
 9. **A9 lock ordering**: acquire the entire possible blocking task set in UUID order before any write, then batch, then slots. Terminal transitions use `prepare_transition`; leaf completions need only their guarded root UPDATE. Later dead-end ancestor locks are nonblocking. Timeout attempts use `SKIP LOCKED` for the complete downward set and defer without writes if any row is missing. Rule-free batch claims also lock in UUID order; retention only archives its locked subset. Slot keys use Rust byte order and SQL `COLLATE "C"`. Rule admission folds its task lock into the first slot upsert. This relies on immutable terminal states and no new edges into committed graphs.
 10. **Routes are centralized** in `handlers::configure_routes`, shared by main server and test server.
 11. **Actions are per-task** (own records, never shared).
+12. **Dedupe locks span the whole input batch**: collect all applicable advisory keys, sort/deduplicate, and acquire them before task inserts or dedupe counts. Checks and inserts still follow input order, so dedupe can see earlier tasks from the same request. Do not reintroduce per-task lock acquisition.
 
 ## Testing
 
