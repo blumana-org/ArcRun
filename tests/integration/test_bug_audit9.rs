@@ -33,7 +33,7 @@ async fn wait_for_blocker(pool: &DbPool, blocker: i32) -> i32 {
             .load(&mut observer)
             .await
             .unwrap();
-            if let Some(waiter) = waiters.as_slice().first() {
+            if let [waiter, ..] = waiters.as_slice() {
                 return waiter.pid;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -220,11 +220,11 @@ async fn test_bug3_dedupe_preserves_input_order_with_one_lock_query() {
         .await
         .unwrap();
     assert_eq!(remaining.n, 3);
-    assert_eq!(lock_queries.load(Ordering::Relaxed), 1);
+    assert_eq!(AtomicUsize::load(&lock_queries, Ordering::Relaxed), 1);
     drop(conn);
     create_tasks_ok(&app, &[task_json("plain", "plain", "audit9-plain")]).await;
     assert_eq!(
-        lock_queries.load(Ordering::Relaxed),
+        AtomicUsize::load(&lock_queries, Ordering::Relaxed),
         1,
         "no lock for a rule-free batch"
     );

@@ -631,7 +631,7 @@ async fn benchmark_task_transition_locks() {
             println!(
                 "AUDIT8_BENCH {}",
                 json!({"shape":shape,"tasks":n,"repetition":repetition,
-                "elapsed_ms":elapsed_ms,"app_cpu_ms":cpu_ms,"queries":queries.load(Ordering::Relaxed)})
+                "elapsed_ms":elapsed_ms,"app_cpu_ms":cpu_ms,"queries":AtomicUsize::load(&queries, Ordering::Relaxed)})
             );
         }
     }

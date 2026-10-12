@@ -167,7 +167,7 @@ async fn wait_for_blocker(pool: &DbPool, blockers: &[i32], exclude: i32) -> i32 
             .load(&mut observer)
             .await
             .unwrap();
-            if let Some(waiter) = waiters.as_slice().first() {
+            if let [waiter, ..] = waiters.as_slice() {
                 return waiter.pid;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;

@@ -125,7 +125,7 @@ pub(crate) async fn prepare_transition(
         ))
         .load::<(StatusKind, Option<uuid::Uuid>, Option<bool>)>(conn)
         .await?;
-    let Some(first) = rows.as_slice().first() else {
+    let [first, ..] = rows.as_slice() else {
         return Ok(None);
     };
     let previous_status = first.0;

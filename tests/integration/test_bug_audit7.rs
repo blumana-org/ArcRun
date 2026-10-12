@@ -122,7 +122,7 @@ async fn test_bug3_capacity_cache_skips_repeated_claims_and_resets_after_progres
         vec![created[40].id]
     );
     assert_eq!(
-        counts.transactions.load(Ordering::Relaxed),
+        AtomicUsize::load(&counts.transactions, Ordering::Relaxed),
         2,
         "one saturated probe plus the eligible key, not one transaction per blocked task"
     );
@@ -145,7 +145,10 @@ async fn test_bug3_capacity_cache_skips_repeated_claims_and_resets_after_progres
         claimed.iter().map(|t| t.id).collect::<Vec<_>>(),
         vec![created[0].id]
     );
-    assert_eq!(counts.transactions.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        AtomicUsize::load(&counts.transactions, Ordering::Relaxed),
+        1
+    );
     assert_eq!(
         slot_used(&mut conn, cap, "hot").await,
         130,
@@ -187,7 +190,7 @@ async fn test_bug3_capacity_cache_respects_candidate_thresholds() {
         vec![created[2].id]
     );
     assert_eq!(
-        counts.transactions.load(Ordering::Relaxed),
+        AtomicUsize::load(&counts.transactions, Ordering::Relaxed),
         3,
         "100 blocks, 200 admits, 150 blocks; 50 and 125 reuse proven thresholds"
     );
@@ -243,7 +246,7 @@ async fn test_bug3_capacity_cache_isolates_rejected_slot_in_mixed_rules() {
             vec![created[1].id]
         );
         assert_eq!(
-            counts.transactions.load(Ordering::Relaxed),
+            AtomicUsize::load(&counts.transactions, Ordering::Relaxed),
             2,
             "only the mixed refusal and the independent eligible rule reach SQL"
         );
@@ -309,7 +312,10 @@ async fn test_bug3_capacity_cache_does_not_remember_validation_or_sql_errors() {
         claimed.iter().map(|t| t.id).collect::<Vec<_>>(),
         vec![created[2].id]
     );
-    assert_eq!(counts.transactions.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        AtomicUsize::load(&counts.transactions, Ordering::Relaxed),
+        2
+    );
     assert_eq!(slot_used(&mut conn, cap, "hot").await, 100);
     for id in [created[0].id, created[1].id] {
         let task = snapshot(&mut conn, id).await;
@@ -389,8 +395,8 @@ async fn benchmark_capacity_cache_scans() {
                 json!({
                     "scenario": name, "repetition": repetition, "tasks": tasks, "keys": keys,
                     "elapsed_ms": elapsed_ms, "app_cpu_ms": cpu_ms,
-                    "transactions": counts.transactions.load(Ordering::Relaxed),
-                    "queries": counts.queries.load(Ordering::Relaxed),
+                    "transactions": AtomicUsize::load(&counts.transactions, Ordering::Relaxed),
+                    "queries": AtomicUsize::load(&counts.queries, Ordering::Relaxed),
                 })
             );
         }
