@@ -2,6 +2,7 @@ import { createSignal, createMemo, For, Show } from 'solid-js';
 import type { DagResponse, BasicTask } from '../types';
 import { STATUS_COLORS } from '../constants';
 import { formatDuration } from '../lib/format';
+import { now as clock } from '../lib/clock';
 
 interface Props {
   data: DagResponse | null;
@@ -26,7 +27,9 @@ export default function TimelineView(props: Props) {
       return aTime - bTime;
     });
 
-    const now = Date.now();
+    // Running bars grow with time: tick only while something is running.
+    const live = tasks.some((t) => t.status === 'Running' || t.status === 'Claimed');
+    const now = live ? clock() : Date.now();
     let minTime = Infinity;
     let maxTime = -Infinity;
 
@@ -185,7 +188,8 @@ export default function TimelineView(props: Props) {
             {/* Task rows */}
             <For each={timeline()!.tasks}>
               {(task) => {
-                const tl = timeline()!;
+                // Rows are reused across refreshes and zoom changes: keep
+                // every geometry value reactive.
                 const created = new Date(task.created_at).getTime();
                 const started = task.started_at
                   ? new Date(task.started_at).getTime()
@@ -197,15 +201,15 @@ export default function TimelineView(props: Props) {
                   task.status === 'Running' || task.status === 'Claimed';
 
                 const barStart = started ?? created;
-                const barEnd = ended ?? (isRunning ? tl.now : barStart);
-                const x = timeToX(barStart);
-                const width = Math.max(MIN_BAR_WIDTH, timeToX(barEnd) - x);
+                const barEnd = () => ended ?? (isRunning ? timeline()!.now : barStart);
+                const x = () => timeToX(barStart);
+                const width = () => Math.max(MIN_BAR_WIDTH, timeToX(barEnd()) - x());
                 const color = STATUS_COLORS[task.status] ?? '#666666';
 
                 // Wait bar (created → started)
                 const hasWait = started !== null && started > created;
-                const waitX = timeToX(created);
-                const waitW = hasWait ? timeToX(started!) - waitX : 0;
+                const waitX = () => timeToX(created);
+                const waitW = () => (hasWait ? timeToX(started!) - waitX() : 0);
 
                 return (
                   <div
@@ -244,8 +248,8 @@ export default function TimelineView(props: Props) {
                         <div
                           class="absolute top-1/2 h-0.5 -translate-y-1/2 rounded-full"
                           style={{
-                            left: `${waitX}px`,
-                            width: `${waitW}px`,
+                            left: `${waitX()}px`,
+                            width: `${waitW()}px`,
                             background: color,
                             opacity: '0.25',
                           }}
@@ -257,15 +261,15 @@ export default function TimelineView(props: Props) {
                         class="absolute top-1/2 -translate-y-1/2 rounded-sm"
                         classList={{ 'timeline-pulse': isRunning }}
                         style={{
-                          left: `${x}px`,
-                          width: `${width}px`,
+                          left: `${x()}px`,
+                          width: `${width()}px`,
                           height: '14px',
                           background: color,
                           opacity: '0.85',
                         }}
                       >
                         {/* Inline label for wide bars */}
-                        <Show when={width > 60}>
+                        <Show when={width() > 60}>
                           <span class="absolute inset-0 flex items-center overflow-hidden px-1.5 text-[10px] font-medium text-white/90">
                             {task.name}
                           </span>

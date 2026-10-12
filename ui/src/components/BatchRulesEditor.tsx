@@ -32,12 +32,18 @@ export default function BatchRulesEditor(props: Props) {
     return [...kindSet].sort();
   });
 
+  // Bumped on every kind change / reopen: a late fetch for a previous kind
+  // must not fill the textarea (submit would apply those rules to the new kind).
+  let rulesRequest = 0;
+
   // Reset state only on open transition (false -> true), not on dagData refresh
   createEffect(
     on(
       () => props.open,
       (open, prevOpen) => {
         if (open && !prevOpen) {
+          rulesRequest++;
+          setLoadingRules(false);
           const kinds = availableKinds();
           const first = kinds[0] ?? '';
           setSelectedKind(first);
@@ -55,6 +61,8 @@ export default function BatchRulesEditor(props: Props) {
 
   // When kind changes (user picks a different one), reload rules
   function handleKindChange(kind: string) {
+    rulesRequest++;
+    setLoadingRules(false);
     setSelectedKind(kind);
     setParseError(null);
     setSubmitError(null);
@@ -67,6 +75,7 @@ export default function BatchRulesEditor(props: Props) {
 
   // Fetch full detail of the first non-terminal task of the given kind to get its current rules
   function loadRulesForKind(kind: string) {
+    const req = ++rulesRequest;
     const data = props.dagData;
     if (!data) return;
     const task = data.tasks.find(
@@ -79,13 +88,16 @@ export default function BatchRulesEditor(props: Props) {
     setLoadingRules(true);
     fetchTask(task.id)
       .then((detail) => {
+        if (req !== rulesRequest) return;
         setRulesJson(JSON.stringify(detail.rules ?? [], null, 2));
       })
       .catch((e) => {
         console.warn('Failed to load rules for kind:', kind, e);
-        setRulesJson('[]');
+        if (req === rulesRequest) setRulesJson('[]');
       })
-      .finally(() => setLoadingRules(false));
+      .finally(() => {
+        if (req === rulesRequest) setLoadingRules(false);
+      });
   }
 
   function validateJson(): Strategy[] | null {
@@ -234,6 +246,7 @@ export default function BatchRulesEditor(props: Props) {
             class="w-full rounded border border-white/20 bg-black/40 p-3 font-mono text-xs text-white/90 focus:border-cyan-500/50 focus:outline-none"
             rows={12}
             value={rulesJson()}
+            disabled={loadingRules()}
             onInput={(e) => {
               setRulesJson(e.currentTarget.value);
               setParseError(null);

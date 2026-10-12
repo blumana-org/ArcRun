@@ -1,4 +1,4 @@
-import { onMount, onCleanup, createEffect, on } from 'solid-js';
+import { onMount, onCleanup, createEffect, on, untrack } from 'solid-js';
 import type { DagResponse, BasicTask } from '../types';
 import { STATUS_COLORS } from '../constants';
 import type { CriticalPath } from '../lib/criticalPath';
@@ -203,7 +203,17 @@ export default function DagCanvas(props: Props) {
             });
           }
 
+          // A rebuild on an already-displayed graph (status change under a
+          // filter, new tasks) keeps the user's viewport and selection.
+          const prev = cy
+            ? { zoom: cy.zoom(), pan: cy.pan(), selected: cy.$('node:selected').map((n) => n.id()) }
+            : null;
           initCytoscape(elements);
+          if (prev && cy) {
+            cy.viewport({ zoom: prev.zoom, pan: prev.pan });
+            for (const id of prev.selected) cy.getElementById(id).select();
+          }
+          applyCriticalPath(untrack(() => props.criticalPath));
           currentNodeIds = new Set(data.tasks.map((t) => t.id));
           currentEdgeIds = new Set(data.links.map((l) => `${l.parent_id}-${l.child_id}`));
           currentStatuses = new Map(data.tasks.map((t) => [t.id, t.status]));
@@ -212,23 +222,20 @@ export default function DagCanvas(props: Props) {
     ),
   );
 
+  function applyCriticalPath(cp: CriticalPath | null | undefined) {
+    if (!cy) return;
+    cy.elements().removeClass('critical-path');
+    if (!cp) return;
+    for (const nodeId of cp.nodeIds) {
+      cy.getElementById(nodeId).addClass('critical-path');
+    }
+    for (const edgeId of cp.edgeIds) {
+      cy.getElementById(edgeId).addClass('critical-path');
+    }
+  }
+
   // Apply critical path highlighting
-  createEffect(
-    on(
-      () => props.criticalPath,
-      (cp) => {
-        if (!cy) return;
-        cy.elements().removeClass('critical-path');
-        if (!cp) return;
-        for (const nodeId of cp.nodeIds) {
-          cy.getElementById(nodeId).addClass('critical-path');
-        }
-        for (const edgeId of cp.edgeIds) {
-          cy.getElementById(edgeId).addClass('critical-path');
-        }
-      },
-    ),
-  );
+  createEffect(on(() => props.criticalPath, applyCriticalPath));
 
   onMount(() => {
     props.ref?.({

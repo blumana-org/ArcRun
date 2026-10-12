@@ -1,4 +1,4 @@
-import { onCleanup, createEffect, on } from 'solid-js';
+import { onCleanup, createEffect, on, untrack } from 'solid-js';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { DagData, DagNode, ColorMap } from './types';
@@ -44,11 +44,24 @@ export default function IsometricDag(props: IsometricDagProps) {
   const animTargets = new Map<string, THREE.Vector3>();
   let isAnimating = false;
   let currentGroupBy: 'dag' | 'status' = 'dag';
+  // Camera framing for the current layout. Applied on first build and groupBy
+  // switches only, so refresh-driven rebuilds don't yank the user's zoom.
+  let refit: (() => void) | null = null;
+  let resizeObserver: ResizeObserver | null = null;
 
   const raycaster = new THREE.Raycaster();
   const pointer = new THREE.Vector2();
 
   const refs = { meshToNode, nodeToMesh };
+
+  // Drawing-buffer budget: a full-width ultrawide window at DPR 2 is ~16M
+  // pixels (x4 with MSAA), far more than a few dozen boxes need.
+  const MAX_DRAWING_PIXELS = 8_000_000;
+  function pixelRatioFor(w: number, h: number): number {
+    const dpr = window.devicePixelRatio || 1;
+    const budget = Math.sqrt(MAX_DRAWING_PIXELS / Math.max(1, w * h));
+    return Math.max(1, Math.min(dpr, budget));
+  }
 
   function defaultTooltip(node: DagNode): string[] {
     return [node.label, `${node.status} | ${node.group}`];
@@ -67,8 +80,8 @@ export default function IsometricDag(props: IsometricDagProps) {
     camera.lookAt(0, 0, 0);
 
     renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(pixelRatioFor(containerEl.clientWidth, containerEl.clientHeight));
     renderer.setSize(containerEl.clientWidth, containerEl.clientHeight);
-    renderer.setPixelRatio(window.devicePixelRatio);
     containerEl.appendChild(renderer.domElement);
 
     controls = new OrbitControls(camera, renderer.domElement);
@@ -91,7 +104,8 @@ export default function IsometricDag(props: IsometricDagProps) {
 
     renderer.domElement.addEventListener('pointermove', onPointerMove);
     renderer.domElement.addEventListener('click', onClick);
-    window.addEventListener('resize', onResize);
+    resizeObserver = new ResizeObserver(onResize);
+    resizeObserver.observe(containerEl);
 
     function animate() {
       animFrameId = requestAnimationFrame(animate);
@@ -124,6 +138,7 @@ export default function IsometricDag(props: IsometricDagProps) {
       camera.position.set(-95, 30, 40);
       camera.lookAt(0, 0, 0);
       controls.target.set(0, 0, 0);
+      refit?.();
       controls.update();
     });
   }
@@ -132,11 +147,13 @@ export default function IsometricDag(props: IsometricDagProps) {
     if (!renderer || !camera) return;
     const w = containerEl.clientWidth;
     const h = containerEl.clientHeight;
+    if (w === 0 || h === 0) return;
     const aspect = w / h;
     const frustum = camera.top;
     camera.left = -frustum * aspect;
     camera.right = frustum * aspect;
     camera.updateProjectionMatrix();
+    renderer.setPixelRatio(pixelRatioFor(w, h));
     renderer.setSize(w, h);
   }
 
@@ -256,11 +273,12 @@ export default function IsometricDag(props: IsometricDagProps) {
     camera.updateProjectionMatrix();
   }
 
-  function buildScene(data: DagData) {
+  function buildScene(data: DagData, fit: boolean) {
     if (!scene) return;
     clearScene();
     const result = buildDagSceneObjects(scene, data, refs, props.colorMap, props.statusShellPriority);
-    fitCamera(result.groupCount, result.maxStep, result.cellSizeX, result.cellSizeZ);
+    refit = () => fitCamera(result.groupCount, result.maxStep, result.cellSizeX, result.cellSizeZ);
+    if (fit) refit();
     currentNodeIds = new Set(data.nodes.map((n) => n.id));
     currentEdgeIds = new Set(data.edges.map((e) => `${e.source}-${e.target}`));
     currentStatuses = new Map(data.nodes.map((n) => [n.id, n.status]));
@@ -277,6 +295,22 @@ export default function IsometricDag(props: IsometricDagProps) {
     currentStatuses = new Map(nodes.map((n) => [n.id, n.status]));
   }
 
+  function statusesChanged(nodes: DagNode[]): boolean {
+    return nodes.some((n) => currentStatuses.get(n.id) !== n.status);
+  }
+
+  /** Keep a visible tooltip in sync with refreshed node data. */
+  function refreshTooltip() {
+    if (!hoveredMesh || !tooltipEl || tooltipEl.style.display === 'none') return;
+    const node = meshToNode.get(hoveredMesh);
+    if (!node) {
+      tooltipEl.style.display = 'none';
+      hoveredMesh = null;
+      return;
+    }
+    tooltipEl.textContent = (props.formatTooltip ?? defaultTooltip)(node).join('\n');
+  }
+
   function nodeSetChanged(nodes: DagNode[]): boolean {
     if (nodes.length !== currentNodeIds.size) return true;
     for (const n of nodes) {
@@ -285,11 +319,12 @@ export default function IsometricDag(props: IsometricDagProps) {
     return false;
   }
 
-  function buildStatusScene(data: DagData) {
+  function buildStatusScene(data: DagData, fit: boolean) {
     if (!scene) return;
     clearScene();
     const result = buildStatusSceneObjects(scene, data, refs, props.colorMap, props.orderedStatuses);
-    fitCameraExtent(result.extentX, result.extentZ);
+    refit = () => fitCameraExtent(result.extentX, result.extentZ);
+    if (fit) refit();
     currentNodeIds = new Set(data.nodes.map((n) => n.id));
     currentEdgeIds = new Set(data.edges.map((e) => `${e.source}-${e.target}`));
     currentStatuses = new Map(data.nodes.map((n) => [n.id, n.status]));
@@ -316,7 +351,7 @@ export default function IsometricDag(props: IsometricDagProps) {
     }
     isAnimating = true;
 
-    fitCameraExtent(result.extentX, result.extentZ);
+    refit = () => fitCameraExtent(result.extentX, result.extentZ);
     currentStatuses = new Map(data.nodes.map((n) => [n.id, n.status]));
   }
 
@@ -347,20 +382,27 @@ export default function IsometricDag(props: IsometricDagProps) {
 
         const groupByChanged = groupBy !== currentGroupBy;
         currentGroupBy = groupBy;
+        const fit = groupByChanged || currentNodeIds.size === 0;
 
         if (groupBy === 'status') {
-          if (groupByChanged || currentNodeIds.size === 0 || nodeSetChanged(data.nodes)) {
-            buildStatusScene(data);
-          } else {
+          if (fit || nodeSetChanged(data.nodes)) {
+            buildStatusScene(data, fit);
+          } else if (statusesChanged(data.nodes)) {
             animateToStatusLayout(data);
+          } else {
+            updateColorsInPlace(data.nodes);
           }
         } else {
-          if (!groupByChanged && currentNodeIds.size > 0 && !structureChanged(data.nodes, data.edges, currentNodeIds, currentEdgeIds)) {
+          if (!fit && !structureChanged(data.nodes, data.edges, currentNodeIds, currentEdgeIds)) {
             updateColorsInPlace(data.nodes);
           } else {
-            buildScene(data);
+            buildScene(data, fit);
           }
         }
+
+        // Rebuilt meshes start unhighlighted.
+        if (scene) applyCriticalPathHighlighting(scene, nodeToMesh, untrack(() => props.criticalPath));
+        refreshTooltip();
       },
     ),
   );
@@ -371,6 +413,9 @@ export default function IsometricDag(props: IsometricDagProps) {
     if (renderer) {
       renderer.domElement.removeEventListener('pointermove', onPointerMove);
       renderer.domElement.removeEventListener('click', onClick);
+      // dispose() alone keeps the WebGL context alive; browsers cap live
+      // contexts (~16), and each switch back to this view creates a new one.
+      renderer.forceContextLoss();
       renderer.dispose();
       if (renderer.domElement.parentNode) {
         renderer.domElement.parentNode.removeChild(renderer.domElement);
@@ -379,10 +424,11 @@ export default function IsometricDag(props: IsometricDagProps) {
     if (tooltipEl && tooltipEl.parentNode) {
       tooltipEl.parentNode.removeChild(tooltipEl);
     }
-    window.removeEventListener('resize', onResize);
+    resizeObserver?.disconnect();
     isAnimating = false;
     animTargets.clear();
     clearScene();
+    scene?.traverse(disposeObject);
     scene = null;
     camera = null;
     renderer = null;

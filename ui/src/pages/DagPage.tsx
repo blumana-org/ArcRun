@@ -1,4 +1,4 @@
-import { createSignal, createEffect, on, onCleanup, onMount, Show, For, Switch, Match } from 'solid-js';
+import { createSignal, createEffect, createMemo, on, onCleanup, onMount, Show, For, Switch, Match } from 'solid-js';
 import { useParams, useNavigate } from '@solidjs/router';
 import type { DagResponse, BasicTask, StopBatchResponse, TaskStatus, UpdateBatchRulesResponse } from '../types';
 import { fetchDag, stopBatch, cancelTask } from '../api';
@@ -15,7 +15,8 @@ import BatchRulesEditor from '../components/BatchRulesEditor';
 import KeyboardHelp from '../components/KeyboardHelp';
 import DagToolbar from '../components/DagToolbar';
 import ConfirmModal from '../components/ConfirmModal';
-import { notifyStatusChanges } from '../components/ToastContainer';
+import { notifyStatusChanges, notifyMessage } from '../components/ToastContainer';
+import { shareUnchanged } from '../lib/shareUnchanged';
 import { computeCriticalPath, type CriticalPath } from '../lib/criticalPath';
 import { exportTasksCsv } from '../lib/exportCsv';
 import { setPaletteOpen, setPageCommands, setTaskSource } from '../lib/commands';
@@ -29,6 +30,9 @@ export default function DagPage() {
   const [openTaskIds, setOpenTaskIds] = createSignal<string[]>([]);
   const [loading, setLoading] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
+  // Set when the banner shows a fetch error: polls clear only their own
+  // errors, not an action failure the user hasn't read yet.
+  let errorFromLoad = false;
   const [viewMode, setViewMode] = createSignal<'dag' | 'iso' | 'table' | 'timeline'>('iso');
   const [activeFilters, setActiveFilters] = createSignal<Set<TaskStatus>>(new Set());
   const [activeKinds, setActiveKinds] = createSignal<Set<string>>(new Set());
@@ -70,7 +74,7 @@ export default function DagPage() {
   }
 
   // Combined status + kind filtering
-  const filteredData = () => {
+  const filteredData = createMemo(() => {
     const data = dagData();
     if (!data) return null;
     const statusFilters = activeFilters();
@@ -84,7 +88,7 @@ export default function DagPage() {
     const taskIds = new Set(tasks.map((t) => t.id));
     const links = data.links.filter((l) => taskIds.has(l.parent_id) && taskIds.has(l.child_id));
     return { tasks, links };
-  };
+  });
 
   // Critical path computed on full (unfiltered) data
   const criticalPath = (): CriticalPath | null => {
@@ -115,9 +119,14 @@ export default function DagPage() {
   let canvasApi: DagCanvasAPI | undefined;
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
   let currentBatchId = '';
+  // Only the latest loadDag may apply its response: polls, manual refreshes
+  // and batch switches overlap, and a late response would show stale state.
+  let requestSeq = 0;
+  let disposed = false;
 
   function scheduleRefresh() {
     if (refreshTimer) clearTimeout(refreshTimer);
+    if (disposed) return;
     refreshTimer = setTimeout(() => loadDag(), AUTO_REFRESH_INTERVAL);
   }
 
@@ -125,6 +134,7 @@ export default function DagPage() {
     const batchId = bid ?? params.batchId;
     if (!batchId) return;
 
+    const seq = ++requestSeq;
     const isNewBatch = batchId !== currentBatchId;
     currentBatchId = batchId;
     addRecentBatch(batchId);
@@ -133,14 +143,19 @@ export default function DagPage() {
       clearAllWindows();
       setActiveFilters(new Set<TaskStatus>());
       setActiveKinds(new Set<string>());
+      setDagData(null);
     }
 
     setLoading(true);
-    setError(null);
+    if (errorFromLoad) {
+      setError(null);
+      errorFromLoad = false;
+    }
     setMessage(null);
 
     try {
       const data = await fetchDag(batchId);
+      if (disposed || seq !== requestSeq) return;
       if (data.tasks.length === 0) {
         setMessage('No tasks found for this batch');
         setDagData(null);
@@ -165,17 +180,18 @@ export default function DagPage() {
           }
           notifyStatusChanges(changes);
         }
-        setDagData(data);
+        setDagData(shareUnchanged(isNewBatch ? null : oldData, data));
       }
       setLastRefreshed(Date.now());
     } catch (e) {
+      if (disposed || seq !== requestSeq) return;
       const msg = e instanceof Error ? e.message : 'Failed to load DAG';
       setError(msg);
+      errorFromLoad = true;
       setMessage(`Error: ${msg}`);
-    } finally {
-      setLoading(false);
     }
 
+    setLoading(false);
     scheduleRefresh();
   }
 
@@ -217,10 +233,11 @@ export default function DagPage() {
         result.canceled_running +
         result.canceled_paused;
       setError(null);
-      setMessage(`Batch stopped: ${total} task${total !== 1 ? 's' : ''} canceled`);
+      notifyMessage(`Batch stopped: ${total} task${total !== 1 ? 's' : ''} canceled`);
       await loadDag();
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Failed to cancel batch';
+      errorFromLoad = false;
       setError(msg);
     } finally {
       setCanceling(false);
@@ -230,7 +247,7 @@ export default function DagPage() {
 
   async function handleRulesUpdated(result: UpdateBatchRulesResponse) {
     setShowRulesEditor(false);
-    setMessage(
+    notifyMessage(
       `Rules updated for kind "${result.kind}": ${result.updated_count} task${result.updated_count !== 1 ? 's' : ''} affected`,
     );
     await loadDag();
@@ -253,12 +270,13 @@ export default function DagPage() {
     const results = await Promise.allSettled(taskIds.map((id) => cancelTask(id)));
     const failed = results.filter((r) => r.status === 'rejected').length;
     const succeeded = results.filter((r) => r.status === 'fulfilled').length;
-    if (failed > 0) {
-      setMessage(`Canceled ${succeeded} task${succeeded !== 1 ? 's' : ''}, ${failed} failed`);
-    } else {
-      setMessage(`Canceled ${succeeded} task${succeeded !== 1 ? 's' : ''}`);
-    }
     await loadDag();
+    if (failed > 0) {
+      errorFromLoad = false;
+      setError(`Canceled ${succeeded} task${succeeded !== 1 ? 's' : ''}, ${failed} failed`);
+    } else {
+      notifyMessage(`Canceled ${succeeded} task${succeeded !== 1 ? 's' : ''}`);
+    }
   }
 
   // Keyboard shortcuts
@@ -340,6 +358,7 @@ export default function DagPage() {
   });
 
   onCleanup(() => {
+    disposed = true;
     if (refreshTimer) clearTimeout(refreshTimer);
     window.removeEventListener('keydown', handleKeyDown);
     setPageCommands([]);

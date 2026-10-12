@@ -1,4 +1,5 @@
-import { Show, For, createSignal, createEffect, on } from 'solid-js';
+import { Show, For, createSignal, createEffect, createMemo, on } from 'solid-js';
+import { createStore, reconcile } from 'solid-js/store';
 import type { BasicTask, TaskDetail, ActionDto, Strategy } from '../types';
 import { fetchTask, cancelTask } from '../api';
 import StatusBadge from './StatusBadge';
@@ -30,7 +31,12 @@ function triggerColor(action: ActionDto): string {
 }
 
 export default function TaskInfoPanel(props: Props) {
-  const [detail, setDetail] = createSignal<TaskDetail | null>(null);
+  // Store + reconcile: a refetch returning identical data keeps the same
+  // nested references, so JsonViewer / <For> subtrees (and their inner
+  // scroll + expand state) survive auto-refresh.
+  const [detailStore, setDetailStore] = createStore<{ value: TaskDetail | null }>({ value: null });
+  const detail = () => detailStore.value;
+  const setDetail = (d: TaskDetail | null) => setDetailStore('value', reconcile(d));
   const [loading, setLoading] = createSignal(false);
   const [metadataOpen, setMetadataOpen] = createSignal(false);
   const [actionsOpen, setActionsOpen] = createSignal(false);
@@ -49,10 +55,12 @@ export default function TaskInfoPanel(props: Props) {
     })
     .finally(() => setLoading(false));
 
-  // Refresh detail when task data updates (e.g. auto-refresh)
+  // Refresh detail when the task status changes. The memo dedupes: every
+  // auto-refresh hands us a new task object, and `on` alone would refire.
+  const status = createMemo(() => props.task.status);
   createEffect(
     on(
-      () => props.task.status,
+      status,
       () => {
         fetchTask(props.task.id)
           .then((d) => setDetail(d))
@@ -93,6 +101,15 @@ export default function TaskInfoPanel(props: Props) {
   const hasRules = () => {
     const det = d();
     return det && det.rules && det.rules.length > 0;
+  };
+
+  const progress = () => {
+    const expected = task().expected_count ?? 0;
+    const done = task().success + task().failures;
+    const pct = expected > 0 ? Math.min(100, Math.round((done / expected) * 100)) : 0;
+    const successPct = expected > 0 ? Math.min(100, Math.round((task().success / expected) * 100)) : 0;
+    const failurePct = expected > 0 ? Math.min(100 - successPct, Math.round((task().failures / expected) * 100)) : 0;
+    return { done, pct, successPct, failurePct };
   };
 
   const offset = props.index * WINDOW_OFFSET;
@@ -140,35 +157,26 @@ export default function TaskInfoPanel(props: Props) {
 
       {/* Progress bar when expected_count is set */}
       <Show when={task().expected_count != null}>
-        {(() => {
-          const expected = task().expected_count!;
-          const done = task().success + task().failures;
-          const pct = expected > 0 ? Math.min(100, Math.round((done / expected) * 100)) : 0;
-          const successPct = expected > 0 ? Math.min(100, Math.round((task().success / expected) * 100)) : 0;
-          const failurePct = expected > 0 ? Math.min(100 - successPct, Math.round((task().failures / expected) * 100)) : 0;
-          return (
-            <div class="border-b border-white/10 py-1.5">
-              <div class="flex items-center justify-between mb-1">
-                <span class="text-white/50">Progress</span>
-                <span class="font-mono text-xs text-white/90">
-                  {done} / {expected} ({pct}%)
-                </span>
-              </div>
-              <div class="h-2 w-full rounded-full bg-white/10 overflow-hidden flex">
-                <div
-                  class="h-full bg-emerald-500 transition-all duration-300"
-                  style={{ width: `${successPct}%` }}
-                />
-                <Show when={failurePct > 0}>
-                  <div
-                    class="h-full bg-red-500 transition-all duration-300"
-                    style={{ width: `${failurePct}%` }}
-                  />
-                </Show>
-              </div>
-            </div>
-          );
-        })()}
+        <div class="border-b border-white/10 py-1.5">
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-white/50">Progress</span>
+            <span class="font-mono text-xs text-white/90">
+              {progress().done} / {task().expected_count} ({progress().pct}%)
+            </span>
+          </div>
+          <div class="h-2 w-full rounded-full bg-white/10 overflow-hidden flex">
+            <div
+              class="h-full bg-emerald-500 transition-all duration-300"
+              style={{ width: `${progress().successPct}%` }}
+            />
+            <Show when={progress().failurePct > 0}>
+              <div
+                class="h-full bg-red-500 transition-all duration-300"
+                style={{ width: `${progress().failurePct}%` }}
+              />
+            </Show>
+          </div>
+        </div>
       </Show>
 
       <Show when={loading()}>

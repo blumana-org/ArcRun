@@ -50,6 +50,15 @@ export function notifyStatusChanges(
   }, 4000);
 }
 
+/** Plain-text toast for action outcomes (batch stopped, rules updated, ...). */
+export function notifyMessage(text: string) {
+  const id = nextId++;
+  setToasts((prev) => [...prev.slice(-4), { id, changes: [], summary: text, timestamp: Date.now() }]);
+  setTimeout(() => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, 4000);
+}
+
 function dismissToast(id: number) {
   setToasts((prev) => prev.filter((t) => t.id !== id));
 }

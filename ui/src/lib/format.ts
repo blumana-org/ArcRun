@@ -1,4 +1,5 @@
 /** Consolidated formatting utilities used across components. */
+import { now } from './clock';
 
 /** Relative time string, e.g. "3m ago", "2h ago". */
 export function timeAgo(dateStr: string): string {
@@ -27,11 +28,14 @@ export function formatDuration(ms: number): string {
   return `${h}h ${rm}m`;
 }
 
-/** Format duration between two date strings (or to now if endStr is null). */
+/**
+ * Format duration between two date strings (or to now if endStr is null).
+ * Reads the shared clock, so open-ended durations tick when used in JSX.
+ */
 export function formatDurationFromDates(startStr: string | null, endStr: string | null): string {
   if (!startStr) return '-';
   const start = new Date(startStr).getTime();
-  const end = endStr ? new Date(endStr).getTime() : Date.now();
+  const end = endStr ? new Date(endStr).getTime() : now();
   const ms = end - start;
   if (ms < 0) return '-';
   return formatDuration(ms);

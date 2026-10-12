@@ -44,13 +44,19 @@ export default function BatchesPage() {
 
   const recents = () => getRecentBatches();
 
+  // Latest request wins: a slow earlier search (or a "Load more" for the
+  // previous query) must not overwrite or extend the current results.
+  let loadSeq = 0;
+
   const load = async (pageNum = 0, append = false) => {
+    const seq = ++loadSeq;
     setLoading(true);
     setError(null);
     try {
       const query = search().trim();
       const filters = query ? { name: query } : undefined;
       const results = await listBatches(pageNum, PAGE_SIZE, filters);
+      if (seq !== loadSeq) return;
       if (append) {
         setBatches((prev) => [...prev, ...results]);
       } else {
@@ -59,10 +65,10 @@ export default function BatchesPage() {
       setHasMore(results.length === PAGE_SIZE);
       setPage(pageNum);
     } catch (e) {
+      if (seq !== loadSeq) return;
       setError(e instanceof Error ? e.message : 'Failed to load batches');
-    } finally {
-      setLoading(false);
     }
+    setLoading(false);
   };
 
   function handleKeyDown(e: KeyboardEvent) {
