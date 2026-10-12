@@ -197,7 +197,7 @@ struct QueryPlan {
     plan: Value,
 }
 
-fn kinds_aggregate_inputs(node: &Value) -> (usize, u64) {
+fn kinds_aggregate_inputs(node: &Value) -> (usize, f64) {
     let carries_kinds = node["Node Type"] == "Aggregate"
         && node["Output"].as_array().is_some_and(|output| {
             output
@@ -207,9 +207,11 @@ fn kinds_aggregate_inputs(node: &Value) -> (usize, u64) {
     let mut count = usize::from(carries_kinds);
     let mut rows = if carries_kinds {
         let input = &node["Plans"][0];
-        input["Actual Rows"].as_u64().unwrap() * input["Actual Loops"].as_u64().unwrap()
+        // PostgreSQL 18 reports fractional per-loop row counts. as_f64 also
+        // accepts the integer JSON numbers emitted by older server versions.
+        input["Actual Rows"].as_f64().unwrap() * input["Actual Loops"].as_f64().unwrap()
     } else {
-        0
+        0.0
     };
     if let Some(children) = node["Plans"].as_array() {
         for child in children {
@@ -221,17 +223,17 @@ fn kinds_aggregate_inputs(node: &Value) -> (usize, u64) {
     (count, rows)
 }
 
-fn task_rows_visited(node: &Value) -> u64 {
+fn task_rows_visited(node: &Value) -> f64 {
     let own = if node["Relation Name"] == "task" {
-        (node["Actual Rows"].as_u64().unwrap_or(0)
-            + node["Rows Removed by Filter"].as_u64().unwrap_or(0))
-            * node["Actual Loops"].as_u64().unwrap_or(0)
+        (node["Actual Rows"].as_f64().unwrap()
+            + node["Rows Removed by Filter"].as_f64().unwrap_or(0.0))
+            * node["Actual Loops"].as_f64().unwrap()
     } else {
-        0
+        0.0
     };
     own + node["Plans"]
         .as_array()
-        .map_or(0, |children| children.iter().map(task_rows_visited).sum())
+        .map_or(0.0, |children| children.iter().map(task_rows_visited).sum())
 }
 
 /// Bug 5: ARRAY_AGG(DISTINCT kind) used to consume the entire matching history
@@ -292,11 +294,11 @@ async fn test_bug5_listing_aggregates_kinds_only_on_the_page() {
     let (aggregates, input_rows) = kinds_aggregate_inputs(&plan.plan[0]["Plan"]);
     assert!(aggregates > 0, "no kinds aggregate found: {}", plan.plan);
     assert!(
-        input_rows <= 24,
+        input_rows <= 24.0,
         "kinds aggregation consumed {input_rows} rows for a 24-task page"
     );
     assert!(
-        task_rows_visited(&plan.plan[0]["Plan"]) <= 48,
+        task_rows_visited(&plan.plan[0]["Plan"]) <= 48.0,
         "catalog page selection still scans task history: {}",
         plan.plan
     );
