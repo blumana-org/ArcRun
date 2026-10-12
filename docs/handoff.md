@@ -2,6 +2,22 @@
 
 Contexte de reprise pour la prochaine session.
 
+**Correctif du 2026-10-12, registre des batches** : `batch_catalog` séparé de
+`batch.remaining`, une ligne par batch chaud non vide, min/max des dates et index
+pour le classement. INSERT/DELETE triggers par instruction : backfill et suivi
+atomiques, y compris avec les anciennes instances ; aucune écriture ni aucun
+verrou de registre sur claim/heartbeat/terminaison. Rétention : verrous de registre
+triés après les tâches, puis snapshots frais pour éviter les entrées fantômes lors
+d'archivages concurrents. Le listing sans filtre de tâche (scope/metadata/search
+possibles) sélectionne sa page dans le registre. Les filtres de tâches gardent la
+requête groupée précédente, mesurée plus robuste pour les recherches rares et les
+gros batches. Pagination `page`/OFFSET conservée ; pas de curseur ajouté.
+La migration bloque temporairement les écritures de tâches pendant son backfill ;
+les lectures continuent. Aucune migration appliquée à une base applicative pendant
+ce travail. Mesures, limites et validation : dernière section de
+`docs/perf-correctness-plan.md`. Validation : 396 tests réussis (2 manuels
+ignorés), Clippy strict/fmt OK, zéro deadlock sur les 330 bases d’intégration.
+
 **Correctif du 2026-10-11, audit point 5** : le listing des batches pagine sur
 `batch_id` + date minimale filtrée, puis calcule les kinds et statistiques de
 la page. Les metadata ne participent plus aux regroupements. Même requête et

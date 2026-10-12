@@ -80,12 +80,13 @@ The authoritative column definitions are in `src/schema.rs`; schema changes are 
 | `link` | Parent/child edges with their `requires_success` flag |
 | `action` | Task webhook definitions and their lifecycle triggers |
 | `batch` | Optional batch identity, completion actions, and the number of non-terminal tasks |
+| `batch_catalog` | One row per nonempty hot batch, with minimum/maximum task creation timestamps |
 | `rule_slot` | Shared concurrency counts and capacity charges used during admission |
 | `webhook_outbox` | Pending end, cancel, and batch-complete deliveries, including retry time and lease token |
 | `webhook_execution` | Start-execution idempotency records and completed delivery history |
 | `task_archive` | Archived task records plus `archived_at` |
 
-Every task has a `batch_id`. A separate `batch` row is created only when completion actions, scope, or metadata are supplied. Batches represented solely by task rows have no persisted `remaining` counter.
+Every task has a `batch_id`. A separate `batch` row is created only when completion actions, scope, or metadata are supplied. Every nonempty hot batch has a separate `batch_catalog` entry; this never creates a completion record or a `remaining` counter.
 
 The outbox contains only pending deliveries and has no status column. A terminal delivery is removed from that table and recorded in `webhook_execution` as `success` or `exhausted`. A unique event key and a history check prevent a completed event from being enqueued again.
 
@@ -103,7 +104,15 @@ Retention moves eligible terminal tasks into `task_archive`. `GET /task/{id}` fa
 
 Archiving waits for pending task notifications and batch-completion requirements. This preserves the records needed to compute the final batch payload. An optional archive-retention period eventually deletes archived records; its default of zero keeps them indefinitely.
 
-`GET /batches` selects its page by grouping only batch IDs and the earliest matching task timestamps. It then aggregates matching kinds and all-task status counts/dates for each selected batch using the existing task batch index, and attaches the optional batch metadata outside the aggregates. These reads share one SQL statement and snapshot; no listing counters or additional write locks are introduced. Page selection still visits matching tasks across the hot table, so this reduces aggregation cost without making listing cost independent of total history. The two page-local aggregations read selected tasks separately.
+`GET /batches` selects pages without task filters from `batch_catalog`, indexed by `(first_created_at DESC, batch_id DESC)`. Optional batch scope/metadata/search filters still apply. Matching kinds and all-task status counts/dates are aggregated only for the selected page using the task batch index. All reads share one SQL statement and snapshot; no status counters are added.
+
+Task filters (`kind`, `status`, `name`, creation bounds) retain the grouped selection query: a batch ranks by its earliest **matching** task, which can differ from its earliest hot task. This also preserves heterogeneous legacy timestamps. Task indexes remain available to selective searches; their selection cost still depends on matching task history. Deep `page` offsets still visit skipped candidates; the HTTP pagination contract is unchanged.
+
+The catalog is maintained by **statement-level INSERT/DELETE triggers**, including writes from older replicas during an upgrade. Creation groups only the inserted rows; additional dedupe runs with the same timestamp do not rewrite the catalog tuple. Empty/all-deduped requests have no entry. Retention locks the affected catalog rows in UUID order after its task locks, then reads survivors in separate statements with fresh READ COMMITTED snapshots. Uniform batches need only an existence probe; heterogeneous batches recompute their extrema. The final hot task's archival removes the entry in the same transaction. Claims, heartbeats, terminal transitions and archive purges do not touch the catalog.
+
+`task.batch_id` and `task.created_at` are immutable through the API. Direct SQL that changes those columns, disables triggers or truncates tasks must rebuild the catalog in the same maintenance transaction (lock `task`, clear `batch_catalog`, group hot tasks by batch to insert their min/max creation dates). There is intentionally no UPDATE trigger or per-transition catalog lock.
+
+Migration `2026-10-12-000001_batch_catalog` takes a SHARE ROW EXCLUSIVE lock on `task`, backfills current hot batches and installs the triggers atomically. **Task writes wait during this one-time backfill/index build**; ordinary reads continue. Old replicas remain compatible after commit because maintenance lives in the database. The catalog has no foreign key to the optional `batch` or the archive. Rollback removes its triggers, functions and table without modifying tasks or completion records.
 
 ## Connections and failure handling
 

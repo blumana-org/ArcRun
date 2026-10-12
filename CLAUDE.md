@@ -59,6 +59,7 @@ tests/integration/     # Integration tests (testcontainers PostgreSQL)
 10. **Routes are centralized** in `handlers::configure_routes`, shared by main server and test server.
 11. **Actions are per-task** (own records, never shared).
 12. **Dedupe locks span the whole input batch**: collect all applicable advisory keys, sort/deduplicate, and acquire them before task inserts or dedupe counts. Checks and inserts still follow input order, so dedupe can see earlier tasks from the same request. Do not reintroduce per-task lock acquisition.
+13. **Batch catalog is separate from completion**: INSERT/DELETE statement triggers maintain `batch_catalog` atomically. No lifecycle UPDATE may write or lock it. Retention takes catalog locks in UUID order after its task set, then fresh READ COMMITTED snapshots recheck survivors. `task.batch_id` and `created_at` are immutable through the API; direct SQL changing them or truncating tasks must rebuild the catalog. Never make optional `batch` rows universal to serve listing.
 
 ## Testing
 

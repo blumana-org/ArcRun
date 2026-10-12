@@ -221,10 +221,24 @@ fn kinds_aggregate_inputs(node: &Value) -> (usize, u64) {
     (count, rows)
 }
 
+fn task_rows_visited(node: &Value) -> u64 {
+    let own = if node["Relation Name"] == "task" {
+        (node["Actual Rows"].as_u64().unwrap_or(0)
+            + node["Rows Removed by Filter"].as_u64().unwrap_or(0))
+            * node["Actual Loops"].as_u64().unwrap_or(0)
+    } else {
+        0
+    };
+    own + node["Plans"]
+        .as_array()
+        .map_or(0, |children| children.iter().map(task_rows_visited).sum())
+}
+
 /// Bug 5: ARRAY_AGG(DISTINCT kind) used to consume the entire matching history
 /// before LIMIT. Inspect the actual route's query, then EXPLAIN ANALYZE it: kinds
-/// aggregation may consume only tasks on this page. No timing threshold, index
-/// choice or join algorithm is prescribed. Reverting the SQL makes this fail.
+/// aggregation may consume only tasks on this page. Catalog selection must also
+/// avoid reading the other tasks. No timing threshold, index choice or join
+/// algorithm is prescribed. Reverting either listing optimization makes this fail.
 #[tokio::test]
 async fn test_bug5_listing_aggregates_kinds_only_on_the_page() {
     use diesel::connection::InstrumentationEvent;
@@ -240,7 +254,7 @@ async fn test_bug5_listing_aggregates_kinds_only_on_the_page() {
                 (ARRAY['pending','success','failure'])[1+(i%3)]::status_kind,60,'{}','[]',
                 '2026-01-01'::timestamptz + ((i-1)/12)*interval '1 second'
          FROM generate_series(1,3600) AS s(i);
-         ANALYZE task; ANALYZE batch;",
+         ANALYZE task; ANALYZE batch; ANALYZE batch_catalog;",
     )
     .await
     .unwrap();
@@ -280,5 +294,17 @@ async fn test_bug5_listing_aggregates_kinds_only_on_the_page() {
     assert!(
         input_rows <= 24,
         "kinds aggregation consumed {input_rows} rows for a 24-task page"
+    );
+    assert!(
+        task_rows_visited(&plan.plan[0]["Plan"]) <= 48,
+        "catalog page selection still scans task history: {}",
+        plan.plan
+    );
+
+    drop(conn);
+    assert!(
+        listing(&app, "status=Success&page=9223372036854775807")
+            .await
+            .is_empty()
     );
 }

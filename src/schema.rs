@@ -51,6 +51,14 @@ diesel::table! {
 }
 
 diesel::table! {
+    batch_catalog (batch_id) {
+        batch_id -> Uuid,
+        first_created_at -> Timestamptz,
+        last_created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     link (parent_id, child_id) {
         parent_id -> Uuid,
         child_id -> Uuid,
@@ -178,6 +186,7 @@ diesel::joinable!(webhook_outbox -> batch (batch_id));
 diesel::allow_tables_to_appear_in_same_query!(
     action,
     batch,
+    batch_catalog,
     link,
     rule_slot,
     task,

@@ -747,3 +747,136 @@ propres. Les 325 bases de la dernière suite totalisent **0 deadlock**.
 Artefacts reproductibles dans `/private/tmp/arcrun-listing-cl958fzf/` :
 `bench.py`, `before.sql`, `after.sql`, `results.json`, `profile-results.json`, plans
 JSON, `before-regressions.log`, `integration.log`, `clippy.log`.
+
+
+## 2026-10-12 — Registre transactionnel des batches (point 5)
+
+Implémentation : migration `2026-10-12-000001_batch_catalog`, sélection SQL dans
+`src/db/batch_listing.rs`, régressions `test_bug_audit10` et `test_bug_audit11`.
+Le registre est indépendant de `batch` : aucun batch de completion supplémentaire,
+aucun `remaining` activé pour les POST sous forme de tableau nu.
+
+### Contrat et maintenance
+
+- Une ligne par batch ayant des tâches chaudes : UUID, min/max de `created_at`.
+  Le maximum sert à reconnaître les dates uniformes et éviter un recalcul à chaque
+  passe de rétention. Le listing conserve les dates et statistiques exactes.
+- Triggers **par instruction**, INSERT/DELETE uniquement, dans la transaction des
+  tâches. L'insertion groupe les nouvelles lignes ; les runs de dedupe suivants
+  ne réécrivent pas une ligne aux dates inchangées. Les requêtes vides/dedupées ne
+  créent pas d'entrée. Aucun nouveau round-trip applicatif.
+- La rétention acquiert les lignes de registre affectées en ordre UUID après son
+  ensemble de tâches. Des instructions suivantes relisent les survivants avec des
+  snapshots READ COMMITTED frais : deux rétentions retirant les dernières tâches
+  d'un batch ne peuvent laisser une entrée fantôme. Pour des dates uniformes, un
+  simple test d'existence suffit ; seules les dates hétérogènes sont réagrégées.
+- Aucun trigger UPDATE : claim, heartbeat, compteurs et transitions terminales ne
+  copient pas de lignes dans des tables de transition, ne verrouillent pas le
+  registre et n'y écrivent pas. L'outbox et les transactions métier sont inchangées.
+- La migration bloque les écritures `task` le temps du backfill et de la création
+  des index, puis installe le suivi atomiquement. Lectures ordinaires autorisées.
+  Les anciennes instances sont couvertes par les triggers après commit, ce qui
+  évite un trou pendant un déploiement progressif. Le down ne touche pas aux tâches.
+- `batch_id`/`created_at` restent immuables via l'API. Une modification SQL directe
+  de ces colonnes, un TRUNCATE ou la désactivation des triggers exige une remise en
+  cohérence du registre dans la même transaction de maintenance ; voir architecture.
+
+Les [triggers PostgreSQL](https://www.postgresql.org/docs/17/trigger-definition.html)
+s'exécutent dans la transaction appelante. La fonction de rétention est VOLATILE :
+ses instructions successives peuvent prendre un
+[snapshot frais](https://www.postgresql.org/docs/17/xfunc-volatility.html) après une
+attente de verrou. Le prélock et la relecture ne doivent pas être fusionnés dans une
+seule instruction utilisant un ancien snapshot.
+
+### Sélection de page et limites assumées
+
+Sans filtre de tâche, y compris avec scope/metadata/search de batch, la page vient
+du registre indexé. Les kinds/comptes/dates détaillées sont calculés seulement pour
+les tâches des batches retenus, dans le même snapshot SQL. Plus de GROUP BY de
+l'ensemble de `task` sur le listing courant. L'ordre historique de sélection et
+l'ordre d'affichage des égalités restent inchangés.
+
+Les filtres de tâches (`kind`, `name`, `status`, bornes de création) conservent la
+requête groupée précédente. Ils peuvent changer le minimum **filtré**, distinct du
+minimum global. Une variante expérimentale avec une sonde corrélée par batch était
+plus rapide sur les filtres fréquents mais plus lente sur les filtres absents et
+les très gros batches : elle n'est pas conservée. Le chemin retenu continue donc
+à utiliser les index et le planificateur de tâches, avec son coût de sélection
+global existant. Ni promesse de coût constant pour ces filtres, ni changement de
+résultat ou de fraîcheur.
+
+La pagination reste compatible `page`/`page_size`. OFFSET profond visite encore
+les candidats précédents, mais sur le petit registre sans agrégation de leurs
+tâches. Aucun curseur/API supplémentaire dans ce commit. Une page contenant de
+très gros batches doit toujours lire toutes leurs tâches pour ses comptes exacts.
+
+### Mesures locales avant/après
+
+Comparaison avec **adfaacf** (déjà optimisé : détails après pagination), PostgreSQL
+17.11 local, 200 000 tâches sauf cas minuscule, page de 50, caches chauds. CPU =
+user+system du backend via `log_statement_stats`, médiane de 7 connexions fraîches,
+JIT et parallélisme désactivés pour le profil. Hors HTTP/Rust ; ce n'est pas une
+mesure de throughput de production. Deux requêtes SQL issues des sources finales,
+13 combinaisons de filtres/pagination × 6 jeux de données × plans custom/generic :
+**156 comparaisons de résultats identiques**.
+
+| Répartition, listing sans filtre de tâche | CPU avant | CPU après | Variation |
+|---|---:|---:|---:|
+| 20 000 batches × 10 tâches, avec metadata | 27,107 ms | 2,063 ms | −92 % |
+| 200 batches × 1 000 tâches | 36,346 ms | 14,862 ms | −59 % |
+| 20 000 batches × 10, sans ligne `batch` | 27,134 ms | 1,435 ms | −95 % |
+| 10 batches × 20 000 tâches, stress | 73,178 ms | 54,603 ms | −25 % |
+| 20 000 batches × 10, dates hétérogènes | 28,478 ms | 2,391 ms | −92 % |
+| 50 batches × 1 tâche | 0,963 ms | 0,987 ms | +0,024 ms |
+| Offset 19 000 sur 20 000 batches × 10 | 29,001 ms | 2,757 ms | −90 % |
+
+Le filtre absent garde le chemin précédent : 16,969 → 17,276 ms, SQL équivalent.
+Sur le premier scénario, les accès aux buffers passent de 4 314 à 573. Le pic RSS
+du backend frais passe de 70 320 à 17 136 Kio ; ce RSS inclut des pages partagées
+mappées, **ce n'est pas une réduction de RAM privée ni de RAM totale PostgreSQL
+mesurée**. Sur les très gros batches il reste similaire. Le registre et ses index
+occupent environ **2,92 Mio pour 20 000 batches** dans ce fixture.
+
+Surcoût des écritures, médiane de 9 échantillons après 2 chauffes, ordre alterné,
+bases séparées avant/après et fixtures réinitialisées entre essais ; autovacuum
+désactivé dans ces seules bases jetables, ANALYZE explicite. INSERT SQL des tâches
+avec metadata de 1 Kio, sans simuler actions/advisory/dedupe métier ; le cas runs
+reproduit seulement le découpage SQL de la dedupe. Archivage = MOVE de 1 000 tâches
+préverrouillées, sans actions/outbox. Ces chiffres isolent le coût du registre,
+ils ne mesurent pas la durée complète d'un POST ou d'une passe de rétention.
+
+| Opération | CPU avant | CPU après | Surcoût |
+|---|---:|---:|---:|
+| Création de 10 tâches, un INSERT | 0,399 ms | 0,580 ms | +0,181 ms |
+| Création de 1 000 tâches, un INSERT | 5,468 ms | 6,128 ms | +0,660 ms |
+| Création de 20 tâches, 20 runs | 0,871 ms | 1,161 ms | +0,290 ms |
+| Archivage partiel, 1 batch | 21,556 ms | 23,204 ms | +1,648 ms |
+| Archivage complet, 1 batch | 21,121 ms | 22,221 ms | +1,100 ms |
+| Archivage complet, 100 batches | 21,339 ms | 22,497 ms | +1,158 ms |
+
+Les tables de transition du trigger matérialisent les lignes insérées/supprimées :
+ce coût CPU/mémoire existe à la création et à l'archivage, pas aux transitions de
+statut. Stress 1 000 tâches × 16 Kio (au-delà du payload HTTP par défaut) : INSERT
+44,046 → 59,238 ms CPU. Pas de promesse de surcoût constant sur de gros imports SQL.
+Le gain CPU global dépend de la fréquence des listings par rapport aux créations ;
+une application qui ne liste jamais paie seulement la maintenance du registre.
+
+Artefacts reproductibles : `/private/tmp/arcrun-catalog-xynfy8e8/` contient
+`before.sql`, `after.sql`, `filtered.sql`, `bench.py`, `results.json`, plans JSON,
+`write_bench.py`, `write-results.json` et journaux de validation. Les mesures de la
+variante filtrée expérimentale sont isolées dans `experimental-filtered-results.json`
+et ne décrivent pas le code final.
+
+
+### Validation finale
+
+- 61 tests unitaires + 330 tests d'intégration + 5 doctests réussis ; 2 tests
+  manuels ignorés. `pg_stat_database.deadlocks = 0` sur les 330 bases du run complet.
+- Clippy workspace/all-targets/all-features avec `-D warnings`, fmt et diff check OK.
+- Régressions : backfill de batches nus/hétérogènes, rollback d'insertion, batches
+  vides/dedupés, absence de réécriture entre runs, transitions pendant le verrou
+  du registre, archivages concurrents (suppression finale et mise à jour des dates),
+  filtres/résultats/pagination conservés. Le plan de la route doit lire au maximum
+  les deux agrégations des tâches de sa page, sans scan de sélection global.
+- PostgreSQL de test local uniquement ; migration applicative et déploiement non
+  effectués. Pas de changement frontend.

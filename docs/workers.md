@@ -110,7 +110,7 @@ A task is eligible for archiving when it is terminal and its `ended_at` is older
 
 Before removing actions, webhook records or links, retention locks the selected tasks in UUID order with `SKIP LOCKED`. Only the acquired subset is archived and counted. Busy tasks and their associated records remain for a later pass.
 
-Eligible tasks move to `task_archive` in a transaction that also removes their actions, dependency links, and webhook records. Empty batch records are cleaned up once no pending batch notification requires them.
+Eligible tasks move to `task_archive` in a transaction that also removes their actions, dependency links, and webhook records. The DELETE statement trigger maintains `batch_catalog` in that transaction: sorted catalog locks follow the complete task lock set, then fresh reads remove empty entries or update changed legacy creation dates. Concurrent retention of the same batch can wait here; lifecycle UPDATEs never acquire catalog locks. Empty completion `batch` records are cleaned up once no pending batch notification requires them.
 
 When `RETENTION_ARCHIVE_DAYS` is positive, archive records older than that many days since `archived_at` are deleted. Zero keeps them indefinitely. Both moves and purges are bounded by `RETENTION_BATCH_SIZE`.
 

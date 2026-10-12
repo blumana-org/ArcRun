@@ -27,7 +27,7 @@ pub struct BatchSummaryDto {
     /// Number of tasks not yet terminal, from the denormalized `batch.remaining`
     /// counter. `0` means the batch is complete. `null` for batches
     /// that have no `batch` row (no on_batch_complete / scope / metadata was set —
-    /// such batches are tracked only via `task.batch_id`, so no counter exists).
+    /// the listing catalog does not maintain a completion counter).
     pub remaining: Option<i32>,
 }
 

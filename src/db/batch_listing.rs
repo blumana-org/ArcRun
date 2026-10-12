@@ -41,37 +41,24 @@ struct BatchStatusRow {
     remaining: Option<i32>,
 }
 
-/// List batches with aggregated statistics, supporting optional filters and pagination.
-///
-/// Page selection groups only batch IDs and the first matching task's timestamp.
-/// Kinds and per-status statistics are then aggregated only for that page, before
-/// attaching batch metadata. Kinds use the task filters; statistics use all hot
-/// tasks. One statement keeps both views on the same snapshot. The status pivot
-/// stays in Rust, and batches without a persisted `batch` row remain visible.
-/// All filter parameters are always bound as `Nullable` ($1–$8), so no dynamic
-/// SQL assembly or bind-count branching is needed.
-pub(crate) async fn list_batches<'a>(
-    conn: &mut Conn<'a>,
-    pagination: dtos::Pagination,
-    filter: dtos::BatchFilterDto,
-) -> Result<Vec<dtos::BatchSummaryDto>, DbError> {
-    let kind_filter = filter.kind.map(|k| escape_like_pattern(&k));
-    let name_filter = filter.name.map(|n| escape_like_pattern(&n));
-    let search_filter = filter.search.map(|s| escape_like_pattern(&s));
-    // A malformed filter must never silently broaden the result set. Surface the same
-    // validation error semantics as GET /task instead of turning invalid JSON into NULL.
-    let metadata_filter: Option<serde_json::Value> = match filter.metadata {
-        None => None,
-        Some(raw) => Some(serde_json::from_str(&raw).map_err(|e| {
-            crate::error::ArcRunError::Validation(format!(
-                "invalid `metadata` filter: expected valid JSON ({e})"
-            ))
-        })?),
-    };
+// No task filters: every catalog row represents a nonempty hot batch.
+const CATALOG_BATCH_PAGE: &str = r#"
+    SELECT c.batch_id, c.first_created_at AS first_created
+    FROM batch_catalog c
+    LEFT JOIN batch b ON b.id = c.batch_id
+    WHERE ($6::text IS NULL OR b.scope = $6)
+      AND ($7::jsonb IS NULL OR b.metadata @> $7)
+      AND ($8::text IS NULL OR b.scope ILIKE '%' || $8 || '%'
+           OR b.metadata::text ILIKE '%' || $8 || '%')
+    ORDER BY c.first_created_at DESC, c.batch_id DESC
+    LIMIT $9 OFFSET $10
+"#;
 
-    let rows = diesel::sql_query(
-        r#"
-        WITH paginated_batches AS (
+// A task filter can change both batch membership and its earliest matching
+// timestamp. Keep the existing grouped query: it lets PostgreSQL use task filter
+// indexes and avoids a correlated probe for every batch on selective searches.
+// An indexed catalog page is only sufficient without task-level filters.
+const FILTERED_BATCH_PAGE: &str = r#"
             SELECT
                 t.batch_id,
                 MIN(t.created_at) AS first_created
@@ -91,7 +78,9 @@ pub(crate) async fn list_batches<'a>(
             GROUP BY t.batch_id
             ORDER BY first_created DESC, t.batch_id DESC
             LIMIT $9 OFFSET $10
-        )
+"#;
+
+const BATCH_PAGE_DETAILS: &str = r#"
         SELECT
             pb.batch_id,
             stats.status_text,
@@ -125,20 +114,59 @@ pub(crate) async fn list_batches<'a>(
         ) stats
         LEFT JOIN batch b ON b.id = pb.batch_id
         ORDER BY pb.first_created DESC, pb.batch_id
-        "#,
-    )
-    .bind::<sql_types::Nullable<sql_types::Text>, _>(kind_filter)
-    .bind::<sql_types::Nullable<crate::schema::sql_types::StatusKind>, _>(filter.status)
-    .bind::<sql_types::Nullable<sql_types::Text>, _>(name_filter)
-    .bind::<sql_types::Nullable<sql_types::Timestamptz>, _>(filter.created_after)
-    .bind::<sql_types::Nullable<sql_types::Timestamptz>, _>(filter.created_before)
-    .bind::<sql_types::Nullable<sql_types::Text>, _>(filter.scope)
-    .bind::<sql_types::Nullable<sql_types::Jsonb>, _>(metadata_filter)
-    .bind::<sql_types::Nullable<sql_types::Text>, _>(search_filter)
-    .bind::<sql_types::BigInt, _>(pagination.limit)
-    .bind::<sql_types::BigInt, _>(pagination.offset)
-    .get_results::<BatchStatusRow>(conn)
-    .await?;
+"#;
+
+/// List batches with aggregated statistics, supporting optional filters and pagination.
+///
+/// The catalog selects pages without task filters through its timestamp/UUID
+/// index. Task filters retain the exact minimum matching date through the
+/// existing grouped query, including heterogeneous legacy batches.
+/// Only the selected page aggregates kinds and all-task statistics. Everything
+/// shares one statement/snapshot, including optional completion metadata.
+pub(crate) async fn list_batches<'a>(
+    conn: &mut Conn<'a>,
+    pagination: dtos::Pagination,
+    filter: dtos::BatchFilterDto,
+) -> Result<Vec<dtos::BatchSummaryDto>, DbError> {
+    let kind_filter = filter.kind.map(|k| escape_like_pattern(&k));
+    let name_filter = filter.name.map(|n| escape_like_pattern(&n));
+    let search_filter = filter.search.map(|s| escape_like_pattern(&s));
+    // A malformed filter must never silently broaden the result set. Surface the same
+    // validation error semantics as GET /task instead of turning invalid JSON into NULL.
+    let metadata_filter: Option<serde_json::Value> = match filter.metadata {
+        None => None,
+        Some(raw) => Some(serde_json::from_str(&raw).map_err(|e| {
+            crate::error::ArcRunError::Validation(format!(
+                "invalid `metadata` filter: expected valid JSON ({e})"
+            ))
+        })?),
+    };
+
+    let has_task_filters = kind_filter.is_some()
+        || filter.status.is_some()
+        || name_filter.is_some()
+        || filter.created_after.is_some()
+        || filter.created_before.is_some();
+    // Only static SQL fragments are assembled. Values remain bound ($1–$10).
+    let page_sql = if has_task_filters {
+        FILTERED_BATCH_PAGE
+    } else {
+        CATALOG_BATCH_PAGE
+    };
+    let query = format!("WITH paginated_batches AS ({page_sql}) {BATCH_PAGE_DETAILS}");
+    let rows = diesel::sql_query(query)
+        .bind::<sql_types::Nullable<sql_types::Text>, _>(kind_filter)
+        .bind::<sql_types::Nullable<crate::schema::sql_types::StatusKind>, _>(filter.status)
+        .bind::<sql_types::Nullable<sql_types::Text>, _>(name_filter)
+        .bind::<sql_types::Nullable<sql_types::Timestamptz>, _>(filter.created_after)
+        .bind::<sql_types::Nullable<sql_types::Timestamptz>, _>(filter.created_before)
+        .bind::<sql_types::Nullable<sql_types::Text>, _>(filter.scope)
+        .bind::<sql_types::Nullable<sql_types::Jsonb>, _>(metadata_filter)
+        .bind::<sql_types::Nullable<sql_types::Text>, _>(search_filter)
+        .bind::<sql_types::BigInt, _>(pagination.limit)
+        .bind::<sql_types::BigInt, _>(pagination.offset)
+        .get_results::<BatchStatusRow>(conn)
+        .await?;
 
     // Pivot: rows are ordered by batch, so group contiguous rows by batch_id.
     let mut batches: Vec<dtos::BatchSummaryDto> = Vec::new();
